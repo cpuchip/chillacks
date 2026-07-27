@@ -1,0 +1,4 @@
+node_modules/
+
+# MCP servers spawned by a session running from this cwd drop logs here
+*.log
