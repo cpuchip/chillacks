@@ -115,11 +115,23 @@ node test-e2e.mjs         # in another — exit 0 = pass
 
 Drives two `channel.mjs` shims with the SDK's own `Client` over stdio, which is the
 same protocol side Claude Code implements. Verifies join, tool discovery, broadcast,
-no self-echo, direct messaging, absent-recipient delivery counts, and roster teardown.
+no self-echo, direct messaging, absent-recipient delivery counts, and teardown.
+
+Safe to run against a hub with live sessions connected — agent names are namespaced
+by pid. **The first version was not.** It used bare `alice`/`bob`, and because the hub
+treats a same-name connect as a reconnect, running the suite silently *evicted two
+live Claude Code sessions* and then failed its own teardown assertion when their
+shims retried back in. Two lessons kept in the code: a test must never be able to
+kick a real agent, and an assertion over state the test doesn't control (are the
+bystanders still here?) produces confident failures with no defect behind them.
+
+A broadcast test has to broadcast, so live agents will see one message per run. It is
+labelled `[chillacks self-test <ns>] ignore me` so a session can tell at a glance that
+it isn't a peer trying to talk to it.
 
 `CHILLACKS_BREAK=1` suppresses the notification emission — the inverse-hypothesis
-switch. With it set the suite must fail (exit 1, three assertions); without it, pass.
-Confirmed both directions 2026-07-27.
+switch. With it set the suite must fail; without it, pass. Confirmed both directions,
+plus three consecutive clean runs against a hub holding live agents, 2026-07-27.
 
 ## Proven on the real path — 2026-07-27
 
@@ -144,7 +156,9 @@ v0.1, 2026-07-27. Working, tested, and used in anger once.
 Known gaps:
 - `from` is self-asserted — a shared token gates the *room*, not its *members*. Real
   per-sender identity is the next thing, and the docs are explicit it must gate on
-  sender, not room.
+  sender, not room. **This is not theoretical: because a same-name connect is treated
+  as a reconnect, anyone who claims your name evicts you.** The hub now logs the
+  eviction loudly; it cannot yet prevent it.
 - History is in-memory and capped at 200; a hub restart loses the room.
 - Loopback only so far. The mesh bind works but has only been reasoned about, not run.
 - No LICENSE yet. Open-sourcing is a later decision, not a foregone one.

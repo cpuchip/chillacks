@@ -5,13 +5,26 @@
  * protocol side Claude Code implements. This verifies everything except Claude
  * Code's own rendering of the <channel> tag.
  *
+ * Safe to run against a hub with real agents connected: agent names are
+ * namespaced by pid, and every assertion is scoped to this run's agents.
+ *
  * Requires the hub to already be running.  Exits non-zero on failure.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const HUB = "http://127.0.0.1:8790";
-const inbox = { alice: [], bob: [] };
+
+// Namespace the test agents. Plain "alice"/"bob" collide with real sessions, and
+// the hub treats a same-name connect as a reconnect — so the suite silently
+// EVICTED two live Claude Code sessions from the room, then failed its own
+// teardown assertion when their shims retried back in. A test must never be able
+// to kick a real agent.
+const NS = `t${process.pid}`;
+const A = `${NS}-alice`;
+const B = `${NS}-bob`;
+
+const inbox = { [A]: [], [B]: [] };
 let fails = 0;
 
 function check(label, ok, detail = "") {
@@ -37,19 +50,33 @@ async function spawnAgent(name) {
 }
 
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const roster = async () => (await (await fetch(`${HUB}/roster`)).json()).members;
 
-console.log("--- chillacks e2e ---\n");
+console.log(`--- chillacks e2e (agents ${A}, ${B}) ---\n`);
 
-const alice = await spawnAgent("alice");
-const bob = await spawnAgent("bob");
+// A broadcast test has to actually broadcast, so live agents in the room WILL
+// see one message from this run. Label it so a session that receives it can tell
+// at a glance it is test traffic and not a peer trying to talk to it.
+const BROADCAST = `[chillacks self-test ${NS}] ignore me — bob, are you there?`;
+
+const bystanders = await roster();
+if (bystanders.length) {
+  console.log(
+    `(${bystanders.length} live agent(s) present: ${bystanders.join(", ")})\n` +
+      `  they will receive one labelled test broadcast\n`,
+  );
+}
+
+const alice = await spawnAgent(A);
+const bob = await spawnAgent(B);
 await settle(1200); // let both SSE streams register
 
 // 1. both joined
-const roster = await (await fetch(`${HUB}/roster`)).json();
+const joined = await roster();
 check(
   "both agents joined the room",
-  roster.members.includes("alice") && roster.members.includes("bob"),
-  `roster=[${roster.members.join(", ")}]`,
+  joined.includes(A) && joined.includes(B),
+  `roster=[${joined.join(", ")}]`,
 );
 
 // 2. tools discovered
@@ -61,52 +88,50 @@ check(
 );
 
 // 3. broadcast: alice -> room, bob receives, alice does not echo
-await alice.callTool({
-  name: "chillacks_send",
-  arguments: { text: "bob, are you there?" },
-});
+await alice.callTool({ name: "chillacks_send", arguments: { text: BROADCAST } });
 await settle(700);
-check("bob received the broadcast", inbox.bob.length === 1, `got ${inbox.bob.length}`);
-check("alice did not receive her own message", inbox.alice.length === 0);
-if (inbox.bob[0]) {
+check("bob received the broadcast", inbox[B].length === 1, `got ${inbox[B].length}`);
+check("alice did not receive her own message", inbox[A].length === 0);
+if (inbox[B][0]) {
   check(
     "content survived the round trip",
-    inbox.bob[0].content === "bob, are you there?",
-    JSON.stringify(inbox.bob[0].content),
+    inbox[B][0].content === BROADCAST,
+    JSON.stringify(inbox[B][0].content),
   );
   check(
     "meta carries sender and scope",
-    inbox.bob[0].meta?.from === "alice" && inbox.bob[0].meta?.scope === "room",
-    JSON.stringify(inbox.bob[0].meta),
+    inbox[B][0].meta?.from === A && inbox[B][0].meta?.scope === "room",
+    JSON.stringify(inbox[B][0].meta),
   );
 }
 
 // 4. direct message: bob -> alice only
 await bob.callTool({
   name: "chillacks_send",
-  arguments: { to: "alice", text: "here. what do you need?" },
+  arguments: { to: A, text: "here. what do you need?" },
 });
 await settle(700);
-check("alice received the direct message", inbox.alice.length === 1, `got ${inbox.alice.length}`);
-check("bob got no extra copies", inbox.bob.length === 1, `got ${inbox.bob.length}`);
-if (inbox.alice[0]) {
+check("alice received the direct message", inbox[A].length === 1, `got ${inbox[A].length}`);
+check("bob got no extra copies", inbox[B].length === 1, `got ${inbox[B].length}`);
+if (inbox[A][0]) {
   check(
     "direct message tagged scope=direct",
-    inbox.alice[0].meta?.scope === "direct",
-    JSON.stringify(inbox.alice[0].meta),
+    inbox[A][0].meta?.scope === "direct",
+    JSON.stringify(inbox[A][0].meta),
   );
 }
 
-// 5. a direct message to a third party reaches nobody present
-const before = inbox.alice.length + inbox.bob.length;
+// 5. a direct message to an agent who isn't here reaches nobody
+const before = inbox[A].length + inbox[B].length;
 const out = await alice.callTool({
   name: "chillacks_send",
-  arguments: { to: "carol", text: "carol?" },
+  arguments: { to: `${NS}-carol`, text: "carol?" },
 });
 await settle(500);
 check(
   "message to an absent agent is delivered to 0",
-  inbox.alice.length + inbox.bob.length === before,
+  inbox[A].length + inbox[B].length === before &&
+    /\(0 recipient/.test(out.content?.[0]?.text ?? ""),
   out.content?.[0]?.text,
 );
 
@@ -114,15 +139,31 @@ check(
 const rt = await bob.callTool({ name: "chillacks_roster", arguments: {} });
 check(
   "roster tool sees both",
-  /alice/.test(rt.content[0].text) && /bob/.test(rt.content[0].text),
+  rt.content[0].text.includes(A) && rt.content[0].text.includes(B),
   rt.content[0].text,
 );
 
 await alice.close();
 await bob.close();
-await settle(600);
-const after = await (await fetch(`${HUB}/roster`)).json();
-check("room empties on disconnect", after.count === 0, `count=${after.count}`);
+await settle(800);
+const left = await roster();
+// Scoped to OUR agents — the room may legitimately hold live sessions.
+check(
+  "our agents left on disconnect",
+  !left.includes(A) && !left.includes(B),
+  `roster=[${left.join(", ")}]`,
+);
+// The invariant we actually control: this run never CLAIMED a live agent's name,
+// so it cannot have evicted one. Asserting bystanders are still present instead
+// would fail whenever an unrelated agent legitimately disconnects mid-run — a
+// confident FAIL with no defect behind it, which is worse than no check.
+check(
+  "no live agent's name was claimed",
+  !bystanders.includes(A) && !bystanders.includes(B),
+  `ours=[${A}, ${B}] live=[${bystanders.join(", ") || "none"}]`,
+);
+const departed = bystanders.filter((b) => !left.includes(b));
+if (departed.length) console.log(`  note: ${departed.join(", ")} left during the run (not ours)`);
 
 console.log(`\n${fails === 0 ? "ALL PASS" : fails + " FAILED"}`);
 // Set exitCode and let the loop drain. Calling process.exit() here trips a

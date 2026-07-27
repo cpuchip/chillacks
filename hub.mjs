@@ -82,8 +82,14 @@ const server = http.createServer(async (req, res) => {
     const name = url.searchParams.get("agent");
     if (!name) return json(400, { error: "agent required" });
 
-    // A reconnect replaces the old stream rather than doubling delivery.
-    members.get(name)?.res.end();
+    // A reconnect replaces the old stream rather than doubling delivery. With
+    // self-asserted names that also means anyone can EVICT anyone by claiming
+    // their name — so make it loud rather than silent until identity is real.
+    const prior = members.get(name);
+    if (prior) {
+      console.error(`[chillacks] ! ${name} reconnected — evicting the previous stream`);
+      prior.res.end();
+    }
 
     res.writeHead(200, {
       "content-type": "text/event-stream",
