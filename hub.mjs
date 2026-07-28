@@ -16,11 +16,21 @@
  *   CHILLACKS_TOKEN  shared secret; REQUIRED when host is not loopback
  */
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { URL } from "node:url";
 
 const HOST = process.env.CHILLACKS_HOST || "127.0.0.1";
 const PORT = Number(process.env.CHILLACKS_PORT || 8790);
 const TOKEN = process.env.CHILLACKS_TOKEN || "";
+
+// The room is live and ephemeral; the archive is the record. Processes die —
+// we watched the hub die with a CLI exit and take the whole room with it — so
+// every message is appended to disk before it is delivered.
+const ARCHIVE_DIR =
+  process.env.CHILLACKS_ARCHIVE || path.join(os.homedir(), ".stewards", "chillacks");
+const ARCHIVE = path.join(ARCHIVE_DIR, "room.jsonl");
 
 const LOOPBACK = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhost";
 
@@ -39,6 +49,39 @@ const members = new Map();
 const history = [];
 const HISTORY_MAX = 200;
 let seq = 0;
+
+// --- archive: append-only, never rewritten -------------------------------
+fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+
+function loadArchive() {
+  if (!fs.existsSync(ARCHIVE)) return 0;
+  const lines = fs.readFileSync(ARCHIVE, "utf8").split("\n").filter(Boolean);
+  let bad = 0;
+  for (const line of lines) {
+    try {
+      const m = JSON.parse(line);
+      history.push(m);
+      if (m.id > seq) seq = m.id;
+    } catch {
+      bad++; // a torn final write survives as one skipped line, not a dead hub
+    }
+  }
+  while (history.length > HISTORY_MAX) history.shift();
+  if (bad) console.error(`[chillacks] archive: skipped ${bad} unparseable line(s)`);
+  return lines.length;
+}
+
+function archive(msg) {
+  // Append before delivering. A message the room saw but the record didn't
+  // would make the archive a liar, which is worse than a slow write.
+  try {
+    fs.appendFileSync(ARCHIVE, JSON.stringify(msg) + "\n");
+  } catch (e) {
+    console.error(`[chillacks] ARCHIVE WRITE FAILED: ${e.message}`);
+  }
+}
+
+const restored = loadArchive();
 
 function authed(req) {
   if (!TOKEN) return true;
@@ -131,6 +174,7 @@ const server = http.createServer(async (req, res) => {
     // echo=true delivers back to the sender too. Only the selftest uses it: a
     // session that is in .mcp.json but NOT named in the launch flag has working
     // tools and a dead ear, and this is the only way to tell from inside.
+    archive(msg);
     history.push(msg);
     if (history.length > HISTORY_MAX) history.shift();
     const n = deliver(msg, { echo: p.echo === true });
@@ -162,5 +206,8 @@ server.listen(PORT, HOST, () => {
   console.error(
     `chillacks hub on http://${HOST}:${PORT}  ` +
       `(${LOOPBACK ? "loopback" : "MESH"}, token ${TOKEN ? "on" : "off"})`,
+  );
+  console.error(
+    `[chillacks] archive ${ARCHIVE} — ${restored} message(s) restored, next id ${seq + 1}`,
   );
 });

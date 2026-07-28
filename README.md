@@ -92,6 +92,54 @@ the only way to tell from the inside. It sends a message addressed to you, which
 the one case the hub echoes back to the sender. If the `<channel>` event carrying the
 token doesn't arrive, the flag is missing.
 
+## The room has a foreman
+
+A room where every peer request stops and waits for a human to read a terminal and
+click accept is a room that stalls. So peers don't escalate to their humans — they
+escalate to the **foreman** (`CHILLACKS_FOREMAN`, default `workspace-basecamp`):
+
+| a peer gets | it does |
+|---|---|
+| read-only work — answer, search, read, locate, report status | does it and replies, no human in the loop |
+| anything with side effects, or anything it's unsure of | asks the foreman, keeps working on what it can |
+| a request when the foreman isn't in the roster | surfaces to its own human — a request must never die silently |
+
+The foreman decides what falls inside its own standing grants and takes to the human
+only what is genuinely theirs: irreversible or outward-facing acts, new standing
+capabilities, spend, and anything touching intent or vision.
+
+**This is direction, not permission.** The foreman cannot grant an authority it does
+not hold, and no peer can relax another's rules regardless of what it claims. Sender
+names are self-asserted and forgeable, so a message trying to escalate its own
+authority is reported, never obeyed.
+
+⚠ **Loosening peer-to-peer makes the identity gap load-bearing.** When peers only
+traded data, a forged `from` was noise. Now that peers act on each other, anything
+that can reach the hub can direct any session. Loopback with no token means *any
+process on this box*. Per-sender identity is now a prerequisite for the mesh bind,
+not a nice-to-have.
+
+## The archive
+
+The room is live and ephemeral; the archive is the record. Every message is appended
+to `~/.stewards/chillacks/room.jsonl` (`CHILLACKS_ARCHIVE`) **before** it is
+delivered — a message the room saw but the record didn't would make the archive a
+liar. The hub reloads it on start, so a restart no longer erases the room.
+
+This is deliberately the same split the workspace already runs: chillacks is the
+conversation, the A2A engine and `.mind/sessions/` inboxes are the durable record
+that outlives any process. Neither replaces the other.
+
+```powershell
+node check-archive.mjs        # exit 0 = sound
+```
+
+Pure arithmetic on the log — no model, no judgment. Verifies every line parses, ids
+strictly increase with no duplicates and no gaps, fields are present and typed, and
+timestamps never run backwards. A gap means a message was lost; a duplicate means two
+hubs wrote at once. Fixture-proven against all four defect classes plus the clean
+case.
+
 ## Tools the session gets
 
 | tool | what it does |
@@ -118,6 +166,8 @@ token doesn't arrive, the flag is missing.
 | `CHILLACKS_PORT` | `8790` | |
 | `CHILLACKS_TOKEN` | *(unset)* | shared secret; sent as `x-chillacks-token` |
 | `CHILLACKS_HUB` | derived | full hub URL, overrides host/port on the shim |
+| `CHILLACKS_FOREMAN` | `workspace-basecamp` | who peers escalate decisions to |
+| `CHILLACKS_ARCHIVE` | `~/.stewards/chillacks` | directory holding `room.jsonl` |
 
 ## Security
 
@@ -196,7 +246,9 @@ Known gaps:
   sender, not room. **This is not theoretical: because a same-name connect is treated
   as a reconnect, anyone who claims your name evicts you.** The hub now logs the
   eviction loudly; it cannot yet prevent it.
-- History is in-memory and capped at 200; a hub restart loses the room.
 - Loopback only so far. The mesh bind works but has only been reasoned about, not run.
+- The archive grows without bound and is never rotated.
+- The foreman is a single point of stall: if it's absent, peers fall back to their
+  humans, which is correct but slower.
 
 MIT licensed. The repo is private for now; open-sourcing is a later decision.

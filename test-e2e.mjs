@@ -12,6 +12,10 @@
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import fs from "node:fs";
+import os from "node:os";
+import nodePath from "node:path";
+import { spawnSync } from "node:child_process";
 
 const HUB = "http://127.0.0.1:8790";
 
@@ -224,6 +228,37 @@ check(
 );
 const departed = bystanders.filter((b) => !left.includes(b));
 if (departed.length) console.log(`  note: ${departed.join(", ")} left during the run (not ours)`);
+
+// 9. the archive is the record — every message this run sent must be on disk,
+//    and the integrity checker must agree the log is sound.
+const archiveFile = process.env.CHILLACKS_ARCHIVE
+  ? nodePath.join(process.env.CHILLACKS_ARCHIVE, "room.jsonl")
+  : nodePath.join(os.homedir(), ".stewards", "chillacks", "room.jsonl");
+if (fs.existsSync(archiveFile)) {
+  const logged = fs
+    .readFileSync(archiveFile, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l))
+    .filter((m) => m.from === A || m.from === B);
+  // broadcast + direct + absent-recipient + selftest = 4 sent by our agents
+  check("every message this run sent is on disk", logged.length === 4, `found ${logged.length}`);
+  check(
+    "archived text matches what was sent",
+    logged.some((m) => m.text === BROADCAST),
+    logged.map((m) => m.text.slice(0, 24)).join(" | "),
+  );
+  const chk = spawnSync(process.execPath, ["check-archive.mjs", archiveFile], {
+    encoding: "utf8",
+  });
+  check(
+    "archive integrity check passes",
+    chk.status === 0,
+    (chk.stdout || "").trim().split("\n").pop(),
+  );
+} else {
+  check("archive file exists", false, archiveFile);
+}
 
 console.log(`\n${fails === 0 ? "ALL PASS" : fails + " FAILED"}`);
 // Set exitCode and let the loop drain. Calling process.exit() here trips a
