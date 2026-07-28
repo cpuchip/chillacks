@@ -32,18 +32,25 @@ function check(label, ok, detail = "") {
   if (!ok) fails++;
 }
 
-async function spawnAgent(name) {
+/** agent: the CHILLACKS_AGENT value, or null for an unnamed (lurker) session.
+ *  key:   which inbox to file its events under. Kept separate from `agent`
+ *         because passing the inbox key as the name is exactly how the first
+ *         version of the lurker test accidentally NAMED the lurker. */
+async function spawnAgent(agent, key = agent) {
+  const env = { ...process.env };
+  if (agent) env.CHILLACKS_AGENT = agent;
+  else delete env.CHILLACKS_AGENT;
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ["channel.mjs"],
-    env: { ...process.env, CHILLACKS_AGENT: name },
+    env,
     stderr: "ignore",
   });
-  const client = new Client({ name: `test-${name}`, version: "0" }, { capabilities: {} });
+  const client = new Client({ name: `test-${key}`, version: "0" }, { capabilities: {} });
   // NB: fallbackNotificationHandler is a public property on Protocol, NOT a
   // constructor option — passing it in the options object is silently ignored.
   client.fallbackNotificationHandler = async (n) => {
-    if (n.method === "notifications/claude/channel") inbox[name].push(n.params);
+    if (n.method === "notifications/claude/channel") inbox[key]?.push(n.params);
   };
   await client.connect(transport);
   return client;
@@ -51,6 +58,22 @@ async function spawnAgent(name) {
 
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const roster = async () => (await (await fetch(`${HUB}/roster`)).json()).members;
+
+// Say what's wrong instead of dying on an uncaught "fetch failed". The hub also
+// needs a moment to bind after launch, so give it a few tries.
+async function requireHub() {
+  for (let i = 0; i < 10; i++) {
+    try {
+      await roster();
+      return;
+    } catch {
+      await settle(300);
+    }
+  }
+  console.error(`no hub at ${HUB} — start it first:  node hub.mjs`);
+  process.exit(2);
+}
+await requireHub();
 
 console.log(`--- chillacks e2e (agents ${A}, ${B}) ---\n`);
 
@@ -82,8 +105,8 @@ check(
 // 2. tools discovered
 const tools = (await alice.listTools()).tools.map((t) => t.name).sort();
 check(
-  "reply tools exposed",
-  tools.join(",") === "chillacks_roster,chillacks_send",
+  "tools exposed",
+  tools.join(",") === "chillacks_roster,chillacks_selftest,chillacks_send",
   tools.join(","),
 );
 
@@ -142,6 +165,43 @@ check(
   rt.content[0].text.includes(A) && rt.content[0].text.includes(B),
   rt.content[0].text,
 );
+
+// 7. selftest echoes back to the sender — the ONLY message that does. This is
+//    how a session proves it can actually receive, rather than assuming.
+const beforeSelf = inbox[A].length;
+await alice.callTool({ name: "chillacks_selftest", arguments: {} });
+await settle(700);
+const echoed = inbox[A].slice(beforeSelf);
+check("selftest echoes back to the sender", echoed.length === 1, `got ${echoed.length}`);
+check(
+  "selftest echo carries a token and is self-addressed",
+  /chillacks selftest [a-z0-9]{6}/.test(echoed[0]?.content ?? "") &&
+    echoed[0]?.meta?.from === A,
+  JSON.stringify(echoed[0]?.content),
+);
+check("bob did not see the selftest", inbox[B].length === 1, `got ${inbox[B].length}`);
+
+// 8. lurker: loaded from .mcp.json but never named, so never in the room
+inbox.lurker = [];
+const roomBefore = await roster();
+const lurker = await spawnAgent(null, "lurker"); // null = no CHILLACKS_AGENT
+await settle(900);
+const withLurker = await roster();
+// Compare the whole roster, not a name prefix. The prefix version passed while
+// the lurker was in fact sitting in the room under the name "lurker".
+check(
+  "unnamed session does not join the room",
+  withLurker.length === roomBefore.length &&
+    roomBefore.every((m) => withLurker.includes(m)),
+  `before=[${roomBefore.join(", ")}] after=[${withLurker.join(", ")}]`,
+);
+const lst = await lurker.callTool({ name: "chillacks_selftest", arguments: {} });
+check(
+  "lurker selftest reports NOT JOINED",
+  /NOT JOINED/.test(lst.content[0].text),
+  lst.content[0].text.slice(0, 60),
+);
+await lurker.close();
 
 await alice.close();
 await bob.close();

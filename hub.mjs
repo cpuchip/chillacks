@@ -45,10 +45,10 @@ function authed(req) {
   return req.headers["x-chillacks-token"] === TOKEN;
 }
 
-function deliver(msg) {
+function deliver(msg, { echo = false } = {}) {
   let n = 0;
   for (const [name, m] of members) {
-    if (name === msg.from) continue; // don't echo to sender
+    if (name === msg.from && !echo) continue; // normally don't echo to sender
     if (msg.to && msg.to !== name) continue; // direct message
     m.res.write(`data: ${JSON.stringify(msg)}\n\n`);
     n++;
@@ -128,9 +128,12 @@ const server = http.createServer(async (req, res) => {
       text: String(p.text),
       ts: new Date().toISOString(),
     };
+    // echo=true delivers back to the sender too. Only the selftest uses it: a
+    // session that is in .mcp.json but NOT named in the launch flag has working
+    // tools and a dead ear, and this is the only way to tell from inside.
     history.push(msg);
     if (history.length > HISTORY_MAX) history.shift();
-    const n = deliver(msg);
+    const n = deliver(msg, { echo: p.echo === true });
     console.error(
       `[chillacks] ${msg.from} -> ${msg.to || "#room"} [${n}]: ${msg.text.slice(0, 80)}`,
     );

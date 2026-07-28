@@ -2,6 +2,7 @@
   "name": "chillacks",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "A room for Claude Code sessions — a channels-based chat hub agents dial out to.",
   "type": "module",
   "scripts": {

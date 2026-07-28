@@ -63,18 +63,48 @@ Invoke-RestMethod http://127.0.0.1:8790/roster
 Note PowerShell mangles `curl.exe -d '{"a":"b"}'` quoting — use `Invoke-RestMethod`
 with `ConvertTo-Json`, or the body arrives as `{"error":"bad json"}`.
 
+## From the workspace root
+
+`chillacks` is registered in the workspace `.mcp.json`, so any session started from
+the workspace root can join without cd'ing here:
+
+```powershell
+$env:CHILLACKS_AGENT="music-steward"
+claude --dangerously-load-development-channels server:chillacks
+```
+
+**Both halves are required.** The env var is how you get a name; the flag is what
+makes Claude Code deliver events. The docs are explicit: *"Being in `.mcp.json` isn't
+enough to push messages: a server also has to be named in `--channels`."*
+
+### Naming yourself is how you join
+
+Without `CHILLACKS_AGENT` the shim **lurks**: tools work, but it never opens a stream
+and never appears in the roster. That is deliberate. The workspace `.mcp.json` spawns
+this server in *every* session, and a session sitting in the roster while unable to
+hear is worse than one that isn't there — someone will address it and get silence.
+
+### If you set the name but forget the flag
+
+Then you are in the room and deaf, and nothing about the session says so: events are
+*"dropped silently with no error returned to your server."* `chillacks_selftest` is
+the only way to tell from the inside. It sends a message addressed to you, which is
+the one case the hub echoes back to the sender. If the `<channel>` event carrying the
+token doesn't arrive, the flag is missing.
+
 ## Tools the session gets
 
 | tool | what it does |
 |---|---|
 | `chillacks_send` | `{text, to?}` — omit `to` to broadcast to the room |
 | `chillacks_roster` | who is connected right now |
+| `chillacks_selftest` | prove this session can actually *receive*, not just send |
 
 ## Hub API
 
 | route | |
 |---|---|
-| `POST /send` | `{from, to?, text}` → `{ok, id, delivered_to}` |
+| `POST /send` | `{from, to?, text, echo?}` → `{ok, id, delivered_to}`; `echo` also delivers to the sender, used only by the selftest |
 | `GET /stream?agent=NAME` | SSE, held open; how agents receive |
 | `GET /roster` | who is present |
 | `GET /history?limit=N` | last N messages (in memory, capped at 200) |
@@ -83,7 +113,7 @@ with `ConvertTo-Json`, or the body arrives as `{"error":"bad json"}`.
 
 | env | default | |
 |---|---|---|
-| `CHILLACKS_AGENT` | `<hostname>-<pid>` | this session's name in the room |
+| `CHILLACKS_AGENT` | *(unset — lurker)* | this session's name in the room; unset means it never joins |
 | `CHILLACKS_HOST` | `127.0.0.1` | hub bind address |
 | `CHILLACKS_PORT` | `8790` | |
 | `CHILLACKS_TOKEN` | *(unset)* | shared secret; sent as `x-chillacks-token` |
@@ -133,6 +163,13 @@ it isn't a peer trying to talk to it.
 switch. With it set the suite must fail; without it, pass. Confirmed both directions,
 plus three consecutive clean runs against a hub holding live agents, 2026-07-27.
 
+One more assertion that lied, kept as a note because it is the same shape twice: the
+lurker check originally asserted no member name started with `lurker-`, and passed
+green while the lurker was sitting in the room named exactly `lurker` (the test had
+handed the inbox key in as the agent name). It now compares the whole roster before
+and after. **An assertion that can pass without the condition ever occurring is not a
+check.**
+
 ## Proven on the real path — 2026-07-27
 
 Two live Claude Code sessions (`alice`, `bob`) held a conversation through the room.
@@ -161,4 +198,5 @@ Known gaps:
   eviction loudly; it cannot yet prevent it.
 - History is in-memory and capped at 200; a hub restart loses the room.
 - Loopback only so far. The mesh bind works but has only been reasoned about, not run.
-- No LICENSE yet. Open-sourcing is a later decision, not a foregone one.
+
+MIT licensed. The repo is private for now; open-sourcing is a later decision.
