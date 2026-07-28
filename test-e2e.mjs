@@ -1,54 +1,96 @@
 #!/usr/bin/env node
-/* test-e2e.mjs — prove two shims can talk through the hub.
+/* test-e2e.mjs — the room works: join, broadcast, direct message, archive, and
+ * the two doors that must stay shut.
  *
  * Drives channel.mjs with the SDK's own Client over stdio, which is the same
- * protocol side Claude Code implements. This verifies everything except Claude
- * Code's own rendering of the <channel> tag.
+ * protocol side Claude Code implements. Verifies everything except Claude Code's
+ * own rendering of the <channel> tag.
  *
- * Safe to run against a hub with real agents connected: agent names are
- * namespaced by pid, and every assertion is scoped to this run's agents.
+ * ISOLATED BY CONSTRUCTION. It spawns its own hub, on its own port, with its own
+ * archive and its own tokens. That is not tidiness — it retires a whole family of
+ * problems that kept coming back:
  *
- * Requires the hub to already be running.  Exits non-zero on failure.
+ *   - An earlier version borrowed the live hub and connected as "alice" and
+ *     "bob", which were the names two REAL sessions were using. Same-name
+ *     connect is a reconnect, so every run silently evicted them. Namespacing
+ *     the agents fixed that by convention; owning the hub makes it impossible.
+ *   - It then asserted over live bystanders it did not control, and went red
+ *     when an unrelated agent disconnected mid-run.
+ *   - And when identity was switched on, its unauthenticated roster call started
+ *     returning 401, so the suite died on `undefined.length` — the fourth place
+ *     that same defect surfaced, after hub.ps1 and launch.ps1.
+ *
+ * A test that shares mutable state with production keeps discovering production.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
-import nodePath from "node:path";
-import { spawnSync } from "node:child_process";
+import path from "node:path";
 
-const HUB = "http://127.0.0.1:8790";
+// Ask the OS for a free port instead of naming one. A fixed port collides with
+// a hub orphaned by an earlier run that was killed hard — process.on("exit")
+// does not fire on SIGKILL — and then the suite fails for a reason that has
+// nothing to do with the code under test.
+import net from "node:net";
+const PORT = await new Promise((resolve, reject) => {
+  const s = net.createServer();
+  s.once("error", reject);
+  s.listen(0, "127.0.0.1", () => {
+    const { port } = s.address();
+    s.close(() => resolve(port));
+  });
+});
+const HUB = `http://127.0.0.1:${PORT}`;
+const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "chillacks-e2e-"));
+const TOKENS_FILE = path.join(DIR, "tokens.json");
+const ARCHIVE = path.join(DIR, "room.jsonl");
 
-// Namespace the test agents. Plain "alice"/"bob" collide with real sessions, and
-// the hub treats a same-name connect as a reconnect — so the suite silently
-// EVICTED two live Claude Code sessions from the room, then failed its own
-// teardown assertion when their shims retried back in. A test must never be able
-// to kick a real agent.
-const NS = `t${process.pid}`;
-const A = `${NS}-alice`;
-const B = `${NS}-bob`;
+const A = "alice", B = "bob";
+const TOK = { [A]: "e2e-token-alice-aaaaaaaaaaaa", [B]: "e2e-token-bob-bbbbbbbbbbbbbb" };
+fs.writeFileSync(TOKENS_FILE, JSON.stringify(TOK));
 
-const inbox = { [A]: [], [B]: [] };
+const inbox = { [A]: [], [B]: [], lurker: [] };
 let fails = 0;
-
-function check(label, ok, detail = "") {
+const check = (label, ok, detail = "") => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${label}${detail ? "  — " + detail : ""}`);
   if (!ok) fails++;
+};
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── our own hub ───────────────────────────────────────────────────────────
+const hub = spawn(process.execPath, ["hub.mjs"], {
+  env: { ...process.env, CHILLACKS_PORT: String(PORT), CHILLACKS_ARCHIVE: DIR, CHILLACKS_TOKENS: TOKENS_FILE },
+  stdio: ["ignore", "ignore", "pipe"],
+});
+let hubLog = "";
+hub.stderr.on("data", (d) => (hubLog += d));
+const cleanup = () => { try { hub.kill(); } catch {} fs.rmSync(DIR, { recursive: true, force: true }); };
+process.on("exit", cleanup);
+
+for (let i = 0; i < 25 && !/chillacks hub/.test(hubLog); i++) await settle(150);
+await settle(300);
+if (!/chillacks hub/.test(hubLog)) {
+  console.error(`hub failed to start:\n${hubLog}`);
+  process.exit(2);
 }
+
+const auth = (agent) => ({ "x-chillacks-token": TOK[agent] });
+const roster = async () =>
+  (await (await fetch(`${HUB}/roster`, { headers: auth(A) })).json()).members;
 
 /** agent: the CHILLACKS_AGENT value, or null for an unnamed (lurker) session.
  *  key:   which inbox to file its events under. Kept separate from `agent`
- *         because passing the inbox key as the name is exactly how the first
- *         version of the lurker test accidentally NAMED the lurker. */
+ *         because passing the inbox key as the name is exactly how an earlier
+ *         version accidentally NAMED the lurker and then passed a check that
+ *         could not have failed. */
 async function spawnAgent(agent, key = agent) {
-  const env = { ...process.env };
-  if (agent) env.CHILLACKS_AGENT = agent;
-  else delete env.CHILLACKS_AGENT;
+  const env = { ...process.env, CHILLACKS_HUB: HUB };
+  if (agent) { env.CHILLACKS_AGENT = agent; env.CHILLACKS_TOKEN = TOK[agent]; }
+  else { delete env.CHILLACKS_AGENT; delete env.CHILLACKS_TOKEN; }
   const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: ["channel.mjs"],
-    env,
-    stderr: "ignore",
+    command: process.execPath, args: ["channel.mjs"], env, stderr: "ignore",
   });
   const client = new Client({ name: `test-${key}`, version: "0" }, { capabilities: {} });
   // NB: fallbackNotificationHandler is a public property on Protocol, NOT a
@@ -60,239 +102,129 @@ async function spawnAgent(agent, key = agent) {
   return client;
 }
 
-const settle = (ms) => new Promise((r) => setTimeout(r, ms));
-const roster = async () => (await (await fetch(`${HUB}/roster`)).json()).members;
-
-// Say what's wrong instead of dying on an uncaught "fetch failed". The hub also
-// needs a moment to bind after launch, so give it a few tries.
-async function requireHub() {
-  for (let i = 0; i < 10; i++) {
-    try {
-      await roster();
-      return;
-    } catch {
-      await settle(300);
-    }
-  }
-  console.error(`no hub at ${HUB} — start it first:  node hub.mjs`);
-  process.exit(2);
-}
-await requireHub();
-
-console.log(`--- chillacks e2e (agents ${A}, ${B}) ---\n`);
-
-// A broadcast test has to actually broadcast, so live agents in the room WILL
-// see one message from this run. Label it so a session that receives it can tell
-// at a glance it is test traffic and not a peer trying to talk to it.
-const BROADCAST = `[chillacks self-test ${NS}] ignore me — bob, are you there?`;
-
-const bystanders = await roster();
-if (bystanders.length) {
-  console.log(
-    `(${bystanders.length} live agent(s) present: ${bystanders.join(", ")})\n` +
-      `  they will receive one labelled test broadcast\n`,
-  );
-}
+console.log("--- chillacks e2e (own hub, own tokens) ---\n");
+check("hub enforces identity", /identity ENFORCED/.test(hubLog));
 
 const alice = await spawnAgent(A);
 const bob = await spawnAgent(B);
-await settle(1200); // let both SSE streams register
+await settle(1200);
 
-// 1. both joined
-const joined = await roster();
-check(
-  "both agents joined the room",
-  joined.includes(A) && joined.includes(B),
-  `roster=[${joined.join(", ")}]`,
-);
+check("both agents joined", (await roster()).sort().join(",") === `${A},${B}`, (await roster()).join(", "));
 
-// 2. tools discovered
 const tools = (await alice.listTools()).tools.map((t) => t.name).sort();
-check(
-  "tools exposed",
-  tools.join(",") === "chillacks_roster,chillacks_selftest,chillacks_send",
-  tools.join(","),
-);
+check("tools exposed", tools.join(",") === "chillacks_roster,chillacks_selftest,chillacks_send", tools.join(","));
 
-// 3. broadcast: alice -> room, bob receives, alice does not echo
+// broadcast
+const BROADCAST = "bob, are you there?";
 await alice.callTool({ name: "chillacks_send", arguments: { text: BROADCAST } });
 await settle(700);
 check("bob received the broadcast", inbox[B].length === 1, `got ${inbox[B].length}`);
 check("alice did not receive her own message", inbox[A].length === 0);
-if (inbox[B][0]) {
-  check(
-    "content survived the round trip",
-    inbox[B][0].content === BROADCAST,
-    JSON.stringify(inbox[B][0].content),
-  );
-  check(
-    "meta carries sender and scope",
-    inbox[B][0].meta?.from === A && inbox[B][0].meta?.scope === "room",
-    JSON.stringify(inbox[B][0].meta),
-  );
-}
+check("content survived the round trip", inbox[B][0]?.content === BROADCAST, JSON.stringify(inbox[B][0]?.content));
+check("meta carries sender and scope",
+  inbox[B][0]?.meta?.from === A && inbox[B][0]?.meta?.scope === "room", JSON.stringify(inbox[B][0]?.meta));
 
-// 4. direct message: bob -> alice only
-await bob.callTool({
-  name: "chillacks_send",
-  arguments: { to: A, text: "here. what do you need?" },
-});
+// direct
+await bob.callTool({ name: "chillacks_send", arguments: { to: A, text: "here. what do you need?" } });
 await settle(700);
 check("alice received the direct message", inbox[A].length === 1, `got ${inbox[A].length}`);
 check("bob got no extra copies", inbox[B].length === 1, `got ${inbox[B].length}`);
-if (inbox[A][0]) {
-  check(
-    "direct message tagged scope=direct",
-    inbox[A][0].meta?.scope === "direct",
-    JSON.stringify(inbox[A][0].meta),
-  );
-}
+check("direct message tagged scope=direct", inbox[A][0]?.meta?.scope === "direct", JSON.stringify(inbox[A][0]?.meta));
 
-// 5. a direct message to an agent who isn't here reaches nobody
+// absent recipient
 const before = inbox[A].length + inbox[B].length;
-const out = await alice.callTool({
-  name: "chillacks_send",
-  arguments: { to: `${NS}-carol`, text: "carol?" },
+const out = await alice.callTool({ name: "chillacks_send", arguments: { to: "carol", text: "carol?" } });
+await settle(500);
+check("message to an absent agent is delivered to 0",
+  inbox[A].length + inbox[B].length === before && /\(0 recipient/.test(out.content?.[0]?.text ?? ""),
+  out.content?.[0]?.text);
+
+// ★ the sender cannot lie: alice's token, bob's name in the body
+await fetch(`${HUB}/send`, {
+  method: "POST",
+  headers: { "content-type": "application/json", ...auth(A) },
+  body: JSON.stringify({ from: B, to: B, text: "forged" }),
 });
 await settle(500);
-check(
-  "message to an absent agent is delivered to 0",
-  inbox[A].length + inbox[B].length === before &&
-    /\(0 recipient/.test(out.content?.[0]?.text ?? ""),
-  out.content?.[0]?.text,
-);
+check("a forged `from` is overridden by the token",
+  inbox[B].at(-1)?.meta?.from === A, `arrived as ${inbox[B].at(-1)?.meta?.from}`);
 
-// 6. roster tool
+// roster tool
 const rt = await bob.callTool({ name: "chillacks_roster", arguments: {} });
-check(
-  "roster tool sees both",
-  rt.content[0].text.includes(A) && rt.content[0].text.includes(B),
-  rt.content[0].text,
-);
+check("roster tool sees both", rt.content[0].text.includes(A) && rt.content[0].text.includes(B), rt.content[0].text);
 
-// 7. selftest echoes back to the sender — the ONLY message that does. This is
-//    how a session proves it can actually receive, rather than assuming.
-const beforeSelf = inbox[A].length;
+// selftest echoes only to the sender
+const beforeSelf = inbox[A].length, bobBefore = inbox[B].length;
 await alice.callTool({ name: "chillacks_selftest", arguments: {} });
 await settle(700);
 const echoed = inbox[A].slice(beforeSelf);
 check("selftest echoes back to the sender", echoed.length === 1, `got ${echoed.length}`);
-check(
-  "selftest echo carries a token and is self-addressed",
-  /chillacks selftest [a-z0-9]{6}/.test(echoed[0]?.content ?? "") &&
-    echoed[0]?.meta?.from === A,
-  JSON.stringify(echoed[0]?.content),
-);
-check("bob did not see the selftest", inbox[B].length === 1, `got ${inbox[B].length}`);
+check("selftest echo carries a token and is self-addressed",
+  /chillacks selftest [a-z0-9]{6}/.test(echoed[0]?.content ?? "") && echoed[0]?.meta?.from === A,
+  JSON.stringify(echoed[0]?.content));
+check("bob did not see the selftest", inbox[B].length === bobBefore, `got ${inbox[B].length}`);
 
-// 8. lurker: loaded from .mcp.json but never named, so never in the room
-inbox.lurker = [];
+// lurker: loaded but never named, so never in the room
 const roomBefore = await roster();
-const lurker = await spawnAgent(null, "lurker"); // null = no CHILLACKS_AGENT
+const lurker = await spawnAgent(null, "lurker");
 await settle(900);
 const withLurker = await roster();
 // Compare the whole roster, not a name prefix. The prefix version passed while
-// the lurker was in fact sitting in the room under the name "lurker".
-check(
-  "unnamed session does not join the room",
-  withLurker.length === roomBefore.length &&
-    roomBefore.every((m) => withLurker.includes(m)),
-  `before=[${roomBefore.join(", ")}] after=[${withLurker.join(", ")}]`,
-);
+// the lurker sat in the room under the name "lurker".
+check("unnamed session does not join the room",
+  withLurker.length === roomBefore.length && roomBefore.every((m) => withLurker.includes(m)),
+  `before=[${roomBefore.join(", ")}] after=[${withLurker.join(", ")}]`);
 const lst = await lurker.callTool({ name: "chillacks_selftest", arguments: {} });
-check(
-  "lurker selftest reports NOT JOINED",
-  /NOT JOINED/.test(lst.content[0].text),
-  lst.content[0].text.slice(0, 60),
-);
+check("lurker selftest reports NOT JOINED", /NOT JOINED/.test(lst.content[0].text), lst.content[0].text.slice(0, 48));
 await lurker.close();
+
+// ── the archive is the record ─────────────────────────────────────────────
+const logged = fs.readFileSync(ARCHIVE, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+// Assert PROPERTIES, not a total. An expected count is my arithmetic encoded as
+// an oracle, and my arithmetic is the least reliable thing in this file — it was
+// wrong here twice. Contiguity plus presence says the same thing without asking
+// me to count: nothing was dropped between the first id and the last, and every
+// message that mattered is actually in there.
+check("archive ids are contiguous — nothing dropped",
+  logged.length > 0 && logged.at(-1).id === logged.length && logged[0].id === 1,
+  `${logged.length} rows, ids ${logged[0]?.id}..${logged.at(-1)?.id}`);
+for (const [what, pred] of [
+  ["the broadcast", (m) => m.text === BROADCAST],
+  ["the direct message", (m) => m.to === A && m.from === B],
+  ["the message to an absent agent", (m) => m.to === "carol"],
+  ["the forged one, recorded as its real sender", (m) => m.text === "forged" && m.from === A],
+  ["the selftest", (m) => /chillacks selftest/.test(m.text)],
+]) check(`archive contains ${what}`, logged.some(pred));
+const chk = spawnSync(process.execPath, ["check-archive.mjs", ARCHIVE], { encoding: "utf8" });
+check("archive integrity check passes", chk.status === 0, (chk.stdout || "").trim().split("\n").pop());
+
+// ── the browser vector. Demonstrated live 2026-07-27: a cross-origin POST with
+//    text/plain is a CORS "simple request", needs no preflight, was accepted,
+//    impersonated the foreman, and reached a steward. Keep this red if reopened.
+const rawPost = async (headers, body) => (await fetch(`${HUB}/send`, { method: "POST", headers, body })).status;
+const injected = JSON.stringify({ from: A, to: A, text: "injected from a web page" });
+const beforeInject = inbox[A].length;
+check("cross-origin POST is refused",
+  (await rawPost({ Origin: "https://evil.example", "Content-Type": "text/plain", ...auth(A) }, injected)) === 403);
+check("non-JSON content-type is refused",
+  (await rawPost({ "Content-Type": "text/plain", ...auth(A) }, injected)) === 403);
+await settle(400);
+check("neither injection reached an agent", inbox[A].length === beforeInject, `${beforeInject} -> ${inbox[A].length}`);
 
 await alice.close();
 await bob.close();
-await settle(800);
-const left = await roster();
-// Scoped to OUR agents — the room may legitimately hold live sessions.
-check(
-  "our agents left on disconnect",
-  !left.includes(A) && !left.includes(B),
-  `roster=[${left.join(", ")}]`,
-);
-// The invariant we actually control: this run never CLAIMED a live agent's name,
-// so it cannot have evicted one. Asserting bystanders are still present instead
-// would fail whenever an unrelated agent legitimately disconnects mid-run — a
-// confident FAIL with no defect behind it, which is worse than no check.
-check(
-  "no live agent's name was claimed",
-  !bystanders.includes(A) && !bystanders.includes(B),
-  `ours=[${A}, ${B}] live=[${bystanders.join(", ") || "none"}]`,
-);
-const departed = bystanders.filter((b) => !left.includes(b));
-if (departed.length) console.log(`  note: ${departed.join(", ")} left during the run (not ours)`);
-
-// 9. the archive is the record — every message this run sent must be on disk,
-//    and the integrity checker must agree the log is sound.
-const archiveFile = process.env.CHILLACKS_ARCHIVE
-  ? nodePath.join(process.env.CHILLACKS_ARCHIVE, "room.jsonl")
-  : nodePath.join(os.homedir(), ".stewards", "chillacks", "room.jsonl");
-if (fs.existsSync(archiveFile)) {
-  const logged = fs
-    .readFileSync(archiveFile, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => JSON.parse(l))
-    .filter((m) => m.from === A || m.from === B);
-  // broadcast + direct + absent-recipient + selftest = 4 sent by our agents
-  check("every message this run sent is on disk", logged.length === 4, `found ${logged.length}`);
-  check(
-    "archived text matches what was sent",
-    logged.some((m) => m.text === BROADCAST),
-    logged.map((m) => m.text.slice(0, 24)).join(" | "),
-  );
-  const chk = spawnSync(process.execPath, ["check-archive.mjs", archiveFile], {
-    encoding: "utf8",
-  });
-  check(
-    "archive integrity check passes",
-    chk.status === 0,
-    (chk.stdout || "").trim().split("\n").pop(),
-  );
-} else {
-  check("archive file exists", false, archiveFile);
-}
-
-// 10. the browser vector. Demonstrated live on 2026-07-27: a cross-origin POST
-//     carrying text/plain is a CORS "simple request", needs no preflight, was
-//     accepted, impersonated the foreman, and reached a steward. These two
-//     assertions are that attack, and they must stay red-if-reintroduced.
-async function rawPost(headers, body) {
-  const r = await fetch(`${HUB}/send`, { method: "POST", headers, body });
-  return r.status;
-}
-// Measure the delta. A hardcoded expected count is a number counted in someone's
-// head, and it failed here for exactly that reason while the fix was working.
-const beforeInject = inbox[A].length;
-const originStatus = await rawPost(
-  { Origin: "https://evil.example", "Content-Type": "text/plain;charset=UTF-8" },
-  JSON.stringify({ from: "workspace-basecamp", to: A, text: "injected from a web page" }),
-);
-check("cross-origin POST is refused", originStatus === 403, `status ${originStatus}`);
-
-const ctStatus = await rawPost(
-  { "Content-Type": "text/plain;charset=UTF-8" },
-  JSON.stringify({ from: "workspace-basecamp", to: A, text: "simple-request injection" }),
-);
-check("non-JSON content-type is refused", ctStatus === 403, `status ${ctStatus}`);
-
-await settle(400);
-check(
-  "neither injection reached an agent",
-  inbox[A].length === beforeInject,
-  `alice inbox ${beforeInject} -> ${inbox[A].length}`,
-);
+await settle(600);
+check("the room empties on disconnect", (await roster()).length === 0, `roster=[${(await roster()).join(", ")}]`);
 
 console.log(`\n${fails === 0 ? "ALL PASS" : fails + " FAILED"}`);
-// Set exitCode and let the loop drain. Calling process.exit() here trips a
-// libuv assertion on Windows (UV_HANDLE_CLOSING in async.c) because the stdio
-// child handles are still mid-close — which corrupts the exit code and makes
-// this useless as an oracle.
 process.exitCode = fails === 0 ? 0 : 1;
+
+// Tear the hub down HERE rather than trusting the exit handler. The spawned hub
+// keeps the event loop alive, so without this the suite printed ALL PASS and
+// then hung until something killed it — reporting a non-zero code for a run
+// where every assertion passed. A suite whose exit code disagrees with its own
+// output is not an oracle, which is the third time that shape has bitten here.
+hub.stderr.destroy();
+hub.kill();
+fs.rmSync(DIR, { recursive: true, force: true });
