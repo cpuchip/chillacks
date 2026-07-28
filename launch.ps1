@@ -108,12 +108,44 @@ $TokensFile = if ($env:CHILLACKS_TOKENS) { $env:CHILLACKS_TOKENS }
 if (-not $WorkDir) { $WorkDir = $Root }
 
 # --- the room has to exist before anyone joins it -------------------------
-try {
-  $roster = Invoke-RestMethod 'http://127.0.0.1:8790/roster' -TimeoutSec 3
-} catch {
+# A 401 means the hub is UP and enforcing identity, not that it is missing.
+# Conflating the two sent this down the "start the hub" path and then crashed
+# on the retry — including on the -Mint run that was the way to fix it.
+function Read-Roster($tok) {
+  $h = if ($tok) { @{ 'x-chillacks-token' = $tok } } else { @{} }
+  try {
+    return @{ up = $true; roster = (Invoke-RestMethod 'http://127.0.0.1:8790/roster' -Headers $h -TimeoutSec 3) }
+  } catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    if ($code) { return @{ up = $true; roster = $null; code = $code } }   # answered, just not to us
+    return @{ up = $false }
+  }
+}
+
+# Read whatever credential we already have, before minting, so the collision
+# check can actually see the room when identity is on.
+$existing = $null
+if (Test-Path $TokensFile) {
+  try {
+    $t = Get-Content $TokensFile -Raw | ConvertFrom-Json
+    $p = $t.PSObject.Properties[$Agent]
+    $existing = if ($p) { $p.Value } else { ($t.PSObject.Properties | Select-Object -First 1).Value }
+  } catch { }
+}
+
+$probe = Read-Roster $existing
+if (-not $probe.up) {
   Write-Host 'hub is not running — starting it' -ForegroundColor Yellow
   & (Join-Path $PSScriptRoot 'hub.ps1') start
-  $roster = Invoke-RestMethod 'http://127.0.0.1:8790/roster' -TimeoutSec 3
+  $probe = Read-Roster $existing
+}
+$roster = $probe.roster
+
+if (-not $roster) {
+  Write-Host "hub is up and enforcing identity, but no token here can read the room (HTTP $($probe.code))." -ForegroundColor Yellow
+  Write-Host '  Continuing — the name-collision check is skipped, so make sure this agent' -ForegroundColor Yellow
+  Write-Host '  is not already connected somewhere.' -ForegroundColor Yellow
+  $roster = [pscustomobject]@{ members = @() }
 }
 
 if ($roster.members -contains $Agent) {

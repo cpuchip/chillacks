@@ -130,7 +130,18 @@ switch ($Action) {
     if ($enforcing) {
       $tok = Get-AnyToken
       if (-not $tok) {
-        Write-Host 'cannot read the room: identity is on and no usable token is on disk.' -ForegroundColor Yellow
+        # The hub refuses to disable identity when the file empties, so this is
+        # the expected shape of that divergence rather than a broken state.
+        Write-Host ''
+        Write-Host 'DISK AND HUB HAVE DIVERGED.' -ForegroundColor Yellow
+        Write-Host '  The hub is still enforcing with token(s) held in memory, but there are'
+        Write-Host '  none on disk — so sessions launched earlier still work, and nothing new'
+        Write-Host '  can be launched or read from here.'
+        Write-Host ''
+        Write-Host '  mint a token again:   node tokens.mjs add <name>'
+        Write-Host '    (the hub hot-loads it; note this REPLACES the in-memory set, so any'
+        Write-Host '     session holding an older token drops and must relaunch)'
+        Write-Host '  or drop identity:     .\hub.ps1 restart     (with tokens.json empty)' -ForegroundColor DarkGray
         exit 0
       }
       $hdr = @{ 'x-chillacks-token' = $tok }
