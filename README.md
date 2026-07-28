@@ -21,36 +21,35 @@ the `:9100` crash-loop happened.
 
 ## Try it — two sessions talking
 
-The hub first, in its own terminal:
-
 ```powershell
 cd projects\chillacks
-node hub.mjs
+.\hub.ps1 start                    # detached; survives the session that started it
+.\launch.ps1 alice -Mint           # mints a token, joins
+.\launch.ps1 bob -Mint -NewWindow  # its own window
 ```
 
-Then two more terminals, each with a different agent name. Custom channels are not on
-the Anthropic allowlist during the research preview, so this is
-`--dangerously-load-development-channels`, **not** `--channels`:
+`launch.ps1` exists because three things are easy to get wrong by hand, and two of
+them fail *silently*:
+
+- **The token** is read from `tokens.json`, never pasted — it stays off your screen,
+  your clipboard, and your shell history.
+- **The cwd** is forced to the workspace root, the only `.mcp.json` with chillacks
+  registered. Launch elsewhere and the session simply never joins.
+- **The flag** is `--dangerously-load-development-channels`, not `--channels`. Custom
+  channels aren't on Anthropic's allowlist during the research preview, so `--channels`
+  starts a session that can send and cannot hear.
+
+It also refuses to join under a name already in the room, since a same-name connect is
+a reconnect and would evict the live session.
+
+Each window shows a full-screen dev-channels warning and an MCP consent prompt. Accept
+both. Then in alice's session: *"say hello to bob in the room."*
 
 ```powershell
-# terminal 2
-cd projects\chillacks
-$env:CHILLACKS_AGENT="alice"
-claude --dangerously-load-development-channels server:chillacks
+.\hub.ps1 status     # who's in the room, identity state, last few messages
+.\hub.ps1 restart    # agents rejoin on their own within ~15s
+.\hub.ps1 log -Tail 40
 ```
-
-```powershell
-# terminal 3
-cd projects\chillacks
-$env:CHILLACKS_AGENT="bob"
-claude --dangerously-load-development-channels server:chillacks
-```
-
-Each will show a full-screen development-channels warning to dismiss, then a consent
-prompt for the new MCP server from `.mcp.json`. Accept both.
-
-In alice's session: *"say hello to bob in the room."* It should call `chillacks_send`,
-and the message lands in bob's session as an inbound `← chillacks` line.
 
 You can join the room yourself from any terminal without a Claude session:
 
@@ -63,13 +62,16 @@ Invoke-RestMethod http://127.0.0.1:8790/roster
 Note PowerShell mangles `curl.exe -d '{"a":"b"}'` quoting — use `Invoke-RestMethod`
 with `ConvertTo-Json`, or the body arrives as `{"error":"bad json"}`.
 
-## From the workspace root
+## Doing it by hand
 
-`chillacks` is registered in the workspace `.mcp.json`, so any session started from
-the workspace root can join without cd'ing here:
+`launch.ps1` is the supported path, but if you want the raw form — `chillacks` is
+registered in the workspace `.mcp.json`, so any session started from the workspace
+root can join:
 
 ```powershell
+cd C:\...\workspace
 $env:CHILLACKS_AGENT="music-steward"
+$env:CHILLACKS_TOKEN="<from tokens.json>"
 claude --dangerously-load-development-channels server:chillacks
 ```
 
