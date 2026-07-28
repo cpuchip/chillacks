@@ -180,6 +180,19 @@ token maps to. Forgery stops being something to police and becomes impossible to
 express. Without the file the hub still runs on loopback, but says so loudly at
 startup.
 
+**Minting takes effect live.** The hub watches the tokens file, so a token minted while
+it is running is honoured within a moment — no restart, and it works whichever way the
+token was written, rather than depending on every minting path remembering to send a
+notification. `launch.ps1 -Mint` then *verifies* the hub has it by authenticating with
+the new token, instead of assuming.
+
+The reload is deliberately **one-way**. An empty, deleted, or corrupt tokens file keeps
+the last known good set and complains; identity never switches itself back off. Getting
+safer without a restart is a convenience, getting *less* safe without one is a footgun,
+and the two are not symmetric. When identity turns on mid-flight, streams opened while
+the room was open get dropped — every shim retries, so they return properly identified
+within seconds.
+
 ### ⚠ Any web page you visit could post here — this was real
 
 A cross-origin `POST` carrying `content-type: text/plain` is a CORS *simple request*:
@@ -270,6 +283,7 @@ So:
 node hub.mjs              # in one terminal
 node test-e2e.mjs         # in another — 24 assertions, exit 0 = pass
 node test-identity.mjs    # 8 assertions, runs its own hub on :8799
+node test-hotload.mjs     # 11 assertions, own hub on :8798
 node check-archive.mjs    # the record itself
 ```
 

@@ -34,8 +34,28 @@ function Get-HubProcess {
     Where-Object { $_.CommandLine -match 'hub\.mjs' }
 }
 
+# "Is it up?" and "will it serve ME?" are different questions, and conflating
+# them broke this the moment identity was switched on: an unauthenticated probe
+# started returning 401, the catch read that as down, and restart reported
+# failure for a hub that had started perfectly. ANY HTTP reply means it is up.
+# Only a connection failure means it is not.
 function Test-HubUp {
-  try { $null = Invoke-RestMethod "$BaseUrl/roster" -TimeoutSec 3; $true } catch { $false }
+  try {
+    $null = Invoke-WebRequest "$BaseUrl/roster" -UseBasicParsing -TimeoutSec 3
+    return $true
+  } catch {
+    return ($null -ne $_.Exception.Response)   # 401/403/404 are all "answering"
+  }
+}
+
+# A token to read the room with, once identity is on. Any valid one will do —
+# this only reads.
+function Get-AnyToken {
+  if (-not (Test-Path $TokensFile)) { return $null }
+  try {
+    $t = Get-Content $TokensFile -Raw | ConvertFrom-Json
+    return ($t.PSObject.Properties | Select-Object -First 1).Value
+  } catch { return $null }
 }
 
 function Start-Hub {
@@ -106,10 +126,20 @@ switch ($Action) {
       Write-Host "          fix:  node tokens.mjs add <name>   then  .\hub.ps1 restart"
     }
 
+    $hdr = @{}
+    if ($enforcing) {
+      $tok = Get-AnyToken
+      if (-not $tok) {
+        Write-Host 'cannot read the room: identity is on and no usable token is on disk.' -ForegroundColor Yellow
+        exit 0
+      }
+      $hdr = @{ 'x-chillacks-token' = $tok }
+    }
+
     try {
-      $r = Invoke-RestMethod "$BaseUrl/roster" -TimeoutSec 3
+      $r = Invoke-RestMethod "$BaseUrl/roster" -Headers $hdr -TimeoutSec 3
       Write-Host "in the room ($($r.count)): $(if ($r.members) { $r.members -join ', ' } else { '(nobody)' })"
-      $h = Invoke-RestMethod "$BaseUrl/history?limit=5" -TimeoutSec 3
+      $h = Invoke-RestMethod "$BaseUrl/history?limit=5" -Headers $hdr -TimeoutSec 3
       if ($h.messages) {
         Write-Host "`nlast $($h.messages.Count) message(s):"
         $h.messages | ForEach-Object {

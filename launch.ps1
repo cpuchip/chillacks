@@ -140,8 +140,28 @@ if (-not $token) {
     Pop-Location
     $tokens = Get-Content $TokensFile -Raw | ConvertFrom-Json
     $token = $tokens.PSObject.Properties[$Agent].Value
-    Write-Host 'minted. Restart the hub so it picks up the new agent:' -ForegroundColor Yellow
-    Write-Host '  .\hub.ps1 restart'
+
+    # The hub watches the tokens file, so it should already know. Don't assume —
+    # ask it, using the token itself. A hub that has it answers; one that hasn't
+    # reloaded returns 401, and then a restart is genuinely required.
+    $known = $false
+    foreach ($i in 1..8) {
+      Start-Sleep -Milliseconds 250
+      try {
+        $null = Invoke-RestMethod 'http://127.0.0.1:8790/roster' `
+                  -Headers @{ 'x-chillacks-token' = $token } -TimeoutSec 3
+        $known = $true; break
+      } catch {
+        if ($_.Exception.Response.StatusCode.value__ -ne 401) { $known = $true; break }
+      }
+    }
+    if ($known) {
+      Write-Host "minted — the hub picked it up live, no restart needed." -ForegroundColor Green
+    } else {
+      Write-Host 'minted, but the hub has not loaded it (still answering 401).' -ForegroundColor Yellow
+      Write-Host '  run:  .\hub.ps1 restart     then launch again'
+      if (-not (Confirm-Risky 'launch anyway? (y/N)')) { exit 1 }
+    }
   } elseif (Test-Path $TokensFile) {
     $known = $tokens.PSObject.Properties.Name -join ', '
     Write-Host "no token for '$Agent'." -ForegroundColor Red

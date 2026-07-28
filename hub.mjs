@@ -92,24 +92,87 @@ const restored = loadArchive();
 const TOKENS_FILE = process.env.CHILLACKS_TOKENS || path.join(ARCHIVE_DIR, "tokens.json");
 let tokenToName = new Map();
 
-function loadTokens() {
-  tokenToName = new Map();
-  if (!fs.existsSync(TOKENS_FILE)) return;
-  try {
-    const raw = JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"));
-    for (const [name, tok] of Object.entries(raw)) tokenToName.set(tok, name);
-  } catch (e) {
-    console.error(`[chillacks] tokens.json unreadable (${e.message}) — REFUSING to run open`);
-    process.exit(2);
-  }
-}
-loadTokens();
+let AUTH = false;
 
-const AUTH = tokenToName.size > 0;
+/** Read tokens from disk. Returns false if nothing usable was found.
+ *
+ * Deliberately NEVER downgrades. Once the hub is enforcing identity it stays
+ * enforcing: an empty, deleted, or corrupt tokens file keeps the last known
+ * good set and complains, rather than silently reopening the room. Getting
+ * safer without a restart is a convenience; getting *less* safe without one is
+ * a footgun, and the two are not symmetric. */
+function loadTokens({ initial = false } = {}) {
+  let next = new Map();
+  if (fs.existsSync(TOKENS_FILE)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"));
+      for (const [name, tok] of Object.entries(raw)) {
+        if (typeof tok === "string" && tok.length >= 16) next.set(tok, name);
+      }
+    } catch (e) {
+      if (initial) {
+        console.error(`[chillacks] tokens.json unreadable (${e.message}) — REFUSING to run open`);
+        process.exit(2);
+      }
+      console.error(`[chillacks] ! tokens.json unreadable (${e.message}) — KEEPING the previous set`);
+      return false;
+    }
+  }
+
+  if (next.size === 0) {
+    if (AUTH) {
+      console.error(
+        `[chillacks] ! tokens.json is now empty — REFUSING to disable identity. ` +
+          `Restart the hub deliberately if that is really what you want.`,
+      );
+    }
+    return false;
+  }
+
+  const added = [...next.values()].filter((n) => ![...tokenToName.values()].includes(n));
+  tokenToName = next;
+  if (!AUTH) {
+    AUTH = true;
+    if (!initial) console.error(`[chillacks] identity ENABLED live — ${next.size} agent(s)`);
+  }
+  if (added.length && !initial) console.error(`[chillacks] + token(s) for: ${added.join(", ")}`);
+  return true;
+}
+loadTokens({ initial: true });
 
 if (!LOOPBACK && !AUTH) {
   console.error(`chillacks: refusing to bind ${HOST} without per-agent tokens.`);
   process.exit(2);
+}
+
+// Watch the DIRECTORY, not the file: an editor or a writer that replaces rather
+// than truncates would break a file watch, and the file may not exist yet.
+let reloadTimer = null;
+try {
+  fs.watch(ARCHIVE_DIR, (_evt, file) => {
+    if (file !== path.basename(TOKENS_FILE)) return;
+    clearTimeout(reloadTimer); // fs.watch fires several times per write
+    reloadTimer = setTimeout(() => {
+      const before = AUTH;
+      if (loadTokens() && !before) dropUnauthenticated();
+    }, 150);
+  });
+} catch (e) {
+  console.error(`[chillacks] could not watch ${ARCHIVE_DIR} (${e.message}) — tokens need a restart`);
+}
+
+/** When identity turns on mid-flight, streams opened while the room was open
+ *  are still connected and still unauthenticated. Close them; every shim
+ *  retries with backoff, so they come back properly identified within seconds. */
+function dropUnauthenticated() {
+  let n = 0;
+  for (const [name, m] of [...members]) {
+    if (m.authed) continue;
+    m.res.end();
+    members.delete(name);
+    n++;
+  }
+  if (n) console.error(`[chillacks] dropped ${n} pre-identity stream(s) — they will reconnect with tokens`);
 }
 
 /** The authenticated name, or null. Never trust a name off the wire. */
@@ -202,7 +265,9 @@ const server = http.createServer(async (req, res) => {
       connection: "keep-alive",
     });
     res.write(": connected\n\n");
-    members.set(name, { res, joined: Date.now() });
+    // Remember whether this stream proved who it was, so enabling identity
+    // later can tell the pre-identity connections apart and close them.
+    members.set(name, { res, joined: Date.now(), authed: Boolean(who) });
     console.error(`[chillacks] + ${name}  (${members.size} present)`);
 
     const ping = setInterval(() => res.write(": ping\n\n"), 25_000);
