@@ -79,9 +79,27 @@ switch ($Action) {
     }
     Write-Host "hub: running (pid $($p.ProcessId -join ', ')) on $BaseUrl" -ForegroundColor Green
 
-    if (Test-Path $TokensFile) {
-      $names = (Get-Content $TokensFile -Raw | ConvertFrom-Json).PSObject.Properties.Name
-      Write-Host "identity: ENFORCED — $($names.Count) agent(s): $($names -join ', ')" -ForegroundColor Green
+    # ASK THE HUB, don't read the file. The hub loads tokens at startup, so a
+    # tokens.json written afterwards changes nothing until it restarts — and a
+    # status that reported the file would say ENFORCED while the running process
+    # let anyone in. That is the worst kind of check: one that can only reassure.
+    $enforcing = $null
+    try { $null = Invoke-RestMethod "$BaseUrl/roster" -TimeoutSec 3; $enforcing = $false }
+    catch {
+      if ($_.Exception.Response.StatusCode.value__ -eq 401) { $enforcing = $true }
+    }
+
+    $onDisk = if (Test-Path $TokensFile) {
+      (Get-Content $TokensFile -Raw | ConvertFrom-Json).PSObject.Properties.Name
+    } else { @() }
+
+    if ($enforcing) {
+      Write-Host "identity: ENFORCED (verified live) — $($onDisk.Count) agent(s) on disk: $($onDisk -join ', ')" -ForegroundColor Green
+    } elseif ($onDisk.Count -gt 0) {
+      Write-Host 'identity: NOT ENFORCED — but tokens.json EXISTS.' -ForegroundColor Red
+      Write-Host "          The running hub started before those tokens and hasn't read them." -ForegroundColor Red
+      Write-Host "          on disk: $($onDisk -join ', ')"
+      Write-Host "          fix:  .\hub.ps1 restart"
     } else {
       Write-Host 'identity: NOT ENFORCED — names are self-asserted, so anything on' -ForegroundColor Yellow
       Write-Host '          this box can impersonate any agent, including the foreman.' -ForegroundColor Yellow

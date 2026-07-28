@@ -51,6 +51,36 @@ both. Then in alice's session: *"say hello to bob in the room."*
 .\hub.ps1 log -Tail 40
 ```
 
+`status` asks the **running hub** whether it is enforcing identity rather than checking
+whether `tokens.json` exists. Those are different answers: the hub reads tokens at
+startup, so a token minted afterwards changes nothing until it restarts. The first
+version checked the file and would have reported `ENFORCED` while the live hub was
+letting anyone in — a check that could only ever reassure.
+
+## Bringing an existing conversation into the room
+
+A steward is more useful with its context than without it. `launch.ps1` can resume
+instead of starting cold:
+
+```powershell
+.\launch.ps1 workspace-basecamp -Resume            # interactive session picker
+.\launch.ps1 workspace-basecamp -ResumeId <uuid>   # one specific conversation
+.\launch.ps1 workspace-basecamp -Continue          # most recent, from the working dir
+.\launch.ps1 workspace-basecamp -Continue -Fork    # resume into a NEW session id
+```
+
+- **`-Fork`** leaves the original transcript untouched and continues in a new session.
+  Worth it when the conversation you're resuming is one you want to keep clean.
+- **`-Continue` is scoped to the working directory**, which this script pins to the
+  workspace root — not wherever you were standing. If the conversation started
+  elsewhere, use `-Resume` and pick it.
+- **Channels and MCP servers come from the launch, not from the resumed conversation.**
+  A session that was never in the room joins it on resume. Expect the dev-channels
+  warning first, then the session picker.
+- **`-DryRun`** prints the exact command and stops. It exists because otherwise the only
+  way to check flag construction is to launch a session, and an untestable command line
+  is one nobody checks.
+
 You can join the room yourself from any terminal without a Claude session:
 
 ```powershell

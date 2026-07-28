@@ -18,6 +18,11 @@
   .\launch.ps1 music-steward
   .\launch.ps1 workspace-basecamp -NewWindow
   .\launch.ps1 ksp-steward -Mint
+
+  # bring a conversation that already has context into the room
+  .\launch.ps1 workspace-basecamp -Resume
+  .\launch.ps1 workspace-basecamp -ResumeId a6dde1ae-c949-48c9-90f4-e42fb81edeb5
+  .\launch.ps1 workspace-basecamp -Continue -Fork
 #>
 [CmdletBinding()]
 param(
@@ -38,7 +43,29 @@ param(
   [switch]$Supervised,
 
   # Answer yes to the safety prompts. Needed to run this non-interactively.
-  [switch]$Force
+  [switch]$Force,
+
+  # --- resuming an existing conversation ---------------------------------
+  # Bring a conversation that already has context into the room, instead of
+  # starting cold. Pick ONE of these three.
+
+  # Open Claude Code's interactive session picker.
+  [switch]$Resume,
+
+  # Resume one specific conversation by session id (a uuid).
+  [string]$ResumeId,
+
+  # Resume the most recent conversation *from the working directory*, which this
+  # script pins to the workspace root — not wherever you happen to be standing.
+  [switch]$Continue,
+
+  # Resume into a NEW session id, leaving the original transcript untouched.
+  # Worth it when the conversation you're resuming is one you want to keep clean.
+  [switch]$Fork,
+
+  # Print what would be run and stop. Exists so the command construction is
+  # testable — otherwise the only way to check the flags is to launch a session.
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +81,23 @@ function Confirm-Risky([string]$Prompt) {
     Write-Host 'non-interactive: declining. Pass -Force to proceed anyway.' -ForegroundColor Yellow
     return $false
   }
+}
+
+# --- resume options are mutually exclusive; catch it here rather than letting
+#     the CLI take the last one and silently resume the wrong thing ----------
+$resumeModes = @($Resume, [bool]$ResumeId, $Continue) | Where-Object { $_ }
+if ($resumeModes.Count -gt 1) {
+  Write-Host 'pick ONE of -Resume, -ResumeId, -Continue.' -ForegroundColor Red
+  exit 2
+}
+if ($Fork -and $resumeModes.Count -eq 0) {
+  Write-Host '-Fork only means something while resuming. Add -Resume, -ResumeId, or -Continue.' -ForegroundColor Red
+  exit 2
+}
+if ($ResumeId -and $ResumeId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+  Write-Host "-ResumeId wants a session uuid, got '$ResumeId'." -ForegroundColor Red
+  Write-Host '  find one:  claude --resume     (the picker lists them)'
+  exit 2
 }
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -117,12 +161,36 @@ if (-not $token) {
 $claudeArgs = @('--dangerously-load-development-channels', 'server:chillacks')
 if (-not $Supervised) { $claudeArgs += '--dangerously-skip-permissions' }
 
+$resumeNote = 'starting a fresh conversation'
+if ($ResumeId)   { $claudeArgs += @('--resume', $ResumeId); $resumeNote = "resuming session $ResumeId" }
+elseif ($Resume) { $claudeArgs += '--resume';               $resumeNote = 'resuming — the picker will ask which' }
+elseif ($Continue){ $claudeArgs += '--continue';            $resumeNote = "resuming the most recent conversation from $WorkDir" }
+if ($Fork) { $claudeArgs += '--fork-session'; $resumeNote += ', forked into a new session id' }
+
 Write-Host ''
 Write-Host "agent    $Agent"        -ForegroundColor Cyan
 Write-Host "cwd      $WorkDir"
 Write-Host "identity $(if ($token) { 'token loaded from tokens.json' } else { 'NONE — self-asserted' })"
-Write-Host "flags    $($claudeArgs -join ' ')"
+Write-Host "session  $resumeNote"
+Write-Host "command  claude $($claudeArgs -join ' ')"
 Write-Host ''
+if ($Continue) {
+  Write-Host '-Continue is scoped to the working directory above, not to wherever you' -ForegroundColor Yellow
+  Write-Host 'were standing. If the conversation you want was started elsewhere, use' -ForegroundColor Yellow
+  Write-Host '-Resume and pick it from the list.' -ForegroundColor Yellow
+  Write-Host ''
+}
+if ($resumeModes.Count -gt 0) {
+  Write-Host 'Note: channels and MCP servers come from THIS launch, not from the resumed' -ForegroundColor Yellow
+  Write-Host 'conversation — so a session that was never in the room joins it now. Expect' -ForegroundColor Yellow
+  Write-Host 'the dev-channels warning first, then the session picker.' -ForegroundColor Yellow
+  Write-Host ''
+}
+if ($DryRun) {
+  Write-Host 'dry run — nothing launched.' -ForegroundColor Yellow
+  exit 0
+}
+
 Write-Host 'Accept the dev-channels warning and the MCP consent prompt when they appear.'
 Write-Host 'Then ask the session "is the channel working?" to verify with chillacks_selftest.'
 Write-Host ''
