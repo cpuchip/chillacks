@@ -83,9 +83,60 @@ function archive(msg) {
 
 const restored = loadArchive();
 
-function authed(req) {
-  if (!TOKEN) return true;
-  return req.headers["x-chillacks-token"] === TOKEN;
+// --- identity -------------------------------------------------------------
+// Names used to be self-asserted. That was tolerable while peers only traded
+// data; once a peer message became a work order — and a message from the
+// FOREMAN became direction — a forgeable `from` became a forgeable authority.
+// Identity is now derived from a bearer token the hub maps to a name, and the
+// client's claimed `from` is ignored entirely.
+const TOKENS_FILE = process.env.CHILLACKS_TOKENS || path.join(ARCHIVE_DIR, "tokens.json");
+let tokenToName = new Map();
+
+function loadTokens() {
+  tokenToName = new Map();
+  if (!fs.existsSync(TOKENS_FILE)) return;
+  try {
+    const raw = JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"));
+    for (const [name, tok] of Object.entries(raw)) tokenToName.set(tok, name);
+  } catch (e) {
+    console.error(`[chillacks] tokens.json unreadable (${e.message}) — REFUSING to run open`);
+    process.exit(2);
+  }
+}
+loadTokens();
+
+const AUTH = tokenToName.size > 0;
+
+if (!LOOPBACK && !AUTH) {
+  console.error(`chillacks: refusing to bind ${HOST} without per-agent tokens.`);
+  process.exit(2);
+}
+
+/** The authenticated name, or null. Never trust a name off the wire. */
+function identify(req) {
+  const t = req.headers["x-chillacks-token"];
+  return t ? tokenToName.get(t) ?? null : null;
+}
+
+/** Refuse anything a browser could have sent.
+ *
+ * DEMONSTRATED 2026-07-27, not theoretical: a cross-origin POST carrying
+ * `content-type: text/plain` is a CORS "simple request", so there is no
+ * preflight to fail. It was accepted, impersonated the foreman, and was
+ * delivered to a steward — the page cannot read the reply, but the injection
+ * already happened. Any tab is enough; no compromise required.
+ *
+ * Browsers always attach Origin to a cross-origin request and cannot suppress
+ * it. Local clients never send one. Requiring JSON on top forces a preflight
+ * that fails for want of CORS headers, so this holds even if Origin were ever
+ * absent. */
+function browserish(req) {
+  if (req.headers.origin) return "Origin header present";
+  if (req.method === "POST") {
+    const ct = String(req.headers["content-type"] || "");
+    if (!ct.startsWith("application/json")) return "content-type is not application/json";
+  }
+  return null;
 }
 
 function deliver(msg, { echo = false } = {}) {
@@ -118,12 +169,23 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(obj));
   };
 
-  if (!authed(req)) return json(403, { error: "forbidden" });
+  const bad = browserish(req);
+  if (bad) {
+    console.error(`[chillacks] ! refused a browser-shaped request (${bad})`);
+    return json(403, { error: `refused: ${bad}` });
+  }
+
+  const who = identify(req);
+  if (AUTH && !who) return json(401, { error: "unknown or missing token" });
 
   // --- GET /stream?agent=NAME : hold open, push messages -------------------
   if (req.method === "GET" && url.pathname === "/stream") {
-    const name = url.searchParams.get("agent");
-    if (!name) return json(400, { error: "agent required" });
+    const claimed = url.searchParams.get("agent");
+    if (!claimed) return json(400, { error: "agent required" });
+    // Under auth the token names you; the query param may not disagree.
+    if (AUTH && claimed !== who)
+      return json(403, { error: `token is for "${who}", not "${claimed}"` });
+    const name = AUTH ? who : claimed;
 
     // A reconnect replaces the old stream rather than doubling delivery. With
     // self-asserted names that also means anyone can EVICT anyone by claiming
@@ -162,11 +224,15 @@ const server = http.createServer(async (req, res) => {
     } catch {
       return json(400, { error: "bad json" });
     }
-    if (!p.from || !p.text) return json(400, { error: "from and text required" });
+    if (!p.text) return json(400, { error: "text required" });
+    // Under auth the sender is WHO THE TOKEN SAYS, never who the body claims.
+    // Forgery is impossible by construction rather than by policing.
+    const from = AUTH ? who : p.from;
+    if (!from) return json(400, { error: "from required" });
 
     const msg = {
       id: ++seq,
-      from: String(p.from),
+      from: String(from),
       to: p.to ? String(p.to) : null,
       text: String(p.text),
       ts: new Date().toISOString(),
@@ -210,4 +276,13 @@ server.listen(PORT, HOST, () => {
   console.error(
     `[chillacks] archive ${ARCHIVE} — ${restored} message(s) restored, next id ${seq + 1}`,
   );
+  if (AUTH) {
+    console.error(`[chillacks] identity ENFORCED — ${tokenToName.size} agent(s) in ${TOKENS_FILE}`);
+  } else {
+    console.error(
+      `[chillacks] ⚠ NO IDENTITY: names are self-asserted, so any process on this ` +
+        `box can impersonate any agent — including the foreman. Run ` +
+        `\`node tokens.mjs add <name>\` to enforce.`,
+    );
+  }
 });

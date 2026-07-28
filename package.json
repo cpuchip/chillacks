@@ -7,8 +7,11 @@
   "type": "module",
   "scripts": {
     "hub": "node hub.mjs",
-    "test": "node test-e2e.mjs",
-    "check-archive": "node check-archive.mjs"
+    "test": "node test-e2e.mjs && node test-identity.mjs",
+    "test:e2e": "node test-e2e.mjs",
+    "test:identity": "node test-identity.mjs",
+    "check-archive": "node check-archive.mjs",
+    "tokens": "node tokens.mjs"
   },
   "engines": {
     "node": ">=18"

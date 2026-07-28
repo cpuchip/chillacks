@@ -260,6 +260,36 @@ if (fs.existsSync(archiveFile)) {
   check("archive file exists", false, archiveFile);
 }
 
+// 10. the browser vector. Demonstrated live on 2026-07-27: a cross-origin POST
+//     carrying text/plain is a CORS "simple request", needs no preflight, was
+//     accepted, impersonated the foreman, and reached a steward. These two
+//     assertions are that attack, and they must stay red-if-reintroduced.
+async function rawPost(headers, body) {
+  const r = await fetch(`${HUB}/send`, { method: "POST", headers, body });
+  return r.status;
+}
+// Measure the delta. A hardcoded expected count is a number counted in someone's
+// head, and it failed here for exactly that reason while the fix was working.
+const beforeInject = inbox[A].length;
+const originStatus = await rawPost(
+  { Origin: "https://evil.example", "Content-Type": "text/plain;charset=UTF-8" },
+  JSON.stringify({ from: "workspace-basecamp", to: A, text: "injected from a web page" }),
+);
+check("cross-origin POST is refused", originStatus === 403, `status ${originStatus}`);
+
+const ctStatus = await rawPost(
+  { "Content-Type": "text/plain;charset=UTF-8" },
+  JSON.stringify({ from: "workspace-basecamp", to: A, text: "simple-request injection" }),
+);
+check("non-JSON content-type is refused", ctStatus === 403, `status ${ctStatus}`);
+
+await settle(400);
+check(
+  "neither injection reached an agent",
+  inbox[A].length === beforeInject,
+  `alice inbox ${beforeInject} -> ${inbox[A].length}`,
+);
+
 console.log(`\n${fails === 0 ? "ALL PASS" : fails + " FAILED"}`);
 // Set exitCode and let the loop drain. Calling process.exit() here trips a
 // libuv assertion on Windows (UV_HANDLE_CLOSING in async.c) because the stdio
