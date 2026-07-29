@@ -50,6 +50,63 @@ const history = [];
 const HISTORY_MAX = 200;
 let seq = 0;
 
+// --- channels: working groups, so a message wakes the seats it concerns -----
+// The night-orders retro measured the cost of broadcast-as-default: every
+// message woke eight contexts, most to no-op. A channel scopes DELIVERY, not
+// secrecy — any agent may post to any channel; membership decides who wakes.
+// #all is implicit and always everyone.
+/** channel -> Set(agent name) */
+const channels = new Map();
+const CHANNELS_FILE =
+  process.env.CHILLACKS_CHANNELS || path.join(ARCHIVE_DIR, "channels.json");
+
+function loadChannels() {
+  if (!fs.existsSync(CHANNELS_FILE)) return;
+  try {
+    const raw = JSON.parse(fs.readFileSync(CHANNELS_FILE, "utf8"));
+    for (const [ch, names] of Object.entries(raw))
+      if (Array.isArray(names) && names.length) channels.set(ch, new Set(names));
+  } catch (e) {
+    console.error(`[chillacks] channels.json unreadable (${e.message}) — starting with none`);
+  }
+}
+function saveChannels() {
+  try {
+    fs.writeFileSync(
+      CHANNELS_FILE,
+      JSON.stringify(Object.fromEntries([...channels].map(([c, s]) => [c, [...s]])), null, 2),
+    );
+  } catch (e) {
+    console.error(`[chillacks] channels.json write failed: ${e.message}`);
+  }
+}
+loadChannels();
+
+// --- claims: a lease on a shared thing, so an open call can't summon six ----
+// Seven seats converged on one test file from "whoever's awake". A claim is
+// mechanics-not-memory: first claimant holds a 15-minute lease, everyone else
+// is told who has it. Ephemeral BY DESIGN — a hub restart clears the locks,
+// which is also the recovery path for a wedged one.
+/** resource -> { by, since } */
+const claims = new Map();
+const CLAIM_TTL_MS = 15 * 60_000;
+function sweepClaims() {
+  const now = Date.now();
+  for (const [r, c] of claims) if (now - c.since > CLAIM_TTL_MS) claims.delete(r);
+}
+
+const normChannel = (s) => String(s || "").toLowerCase().replace(/^#/, "").trim();
+
+/** @name tokens that match a KNOWN agent (roster or token file). A mention
+ *  reaches across channel boundaries; an unknown @word is just prose. */
+function mentionsIn(text) {
+  const names = new Set([...members.keys(), ...tokenToName.values()]);
+  const out = new Set();
+  for (const m of String(text).matchAll(/@([a-z0-9][a-z0-9_-]*)/gi))
+    if (names.has(m[1])) out.add(m[1]);
+  return [...out];
+}
+
 // --- archive: append-only, never rewritten -------------------------------
 fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 
@@ -203,10 +260,20 @@ function browserish(req) {
 }
 
 function deliver(msg, { echo = false } = {}) {
+  let targets;
+  if (msg.to) {
+    targets = new Set([msg.to]); // direct message
+  } else if (msg.channel) {
+    targets = new Set(channels.get(msg.channel) || []);
+    for (const m of msg.mentions || []) targets.add(m); // mentions cross channels
+  } else {
+    targets = new Set(members.keys()); // #all
+  }
   let n = 0;
-  for (const [name, m] of members) {
+  for (const name of targets) {
     if (name === msg.from && !echo) continue; // normally don't echo to sender
-    if (msg.to && msg.to !== name) continue; // direct message
+    const m = members.get(name);
+    if (!m) continue; // the room archives but does not queue — absent means missed
     m.res.write(`data: ${JSON.stringify(msg)}\n\n`);
     n++;
   }
@@ -295,13 +362,19 @@ const server = http.createServer(async (req, res) => {
     const from = AUTH ? who : p.from;
     if (!from) return json(400, { error: "from required" });
 
+    const channel = p.to ? null : p.channel ? normChannel(p.channel) : null;
     const msg = {
       id: ++seq,
       from: String(from),
       to: p.to ? String(p.to) : null,
+      channel: channel && channel !== "all" ? channel : null,
       text: String(p.text),
       ts: new Date().toISOString(),
     };
+    if (!msg.to) {
+      const men = mentionsIn(msg.text);
+      if (men.length) msg.mentions = men;
+    }
     // echo=true delivers back to the sender too. Only the selftest uses it: a
     // session that is in .mcp.json but NOT named in the launch flag has working
     // tools and a dead ear, and this is the only way to tell from inside.
@@ -310,24 +383,136 @@ const server = http.createServer(async (req, res) => {
     if (history.length > HISTORY_MAX) history.shift();
     const n = deliver(msg, { echo: p.echo === true });
     console.error(
-      `[chillacks] ${msg.from} -> ${msg.to || "#room"} [${n}]: ${msg.text.slice(0, 80)}`,
+      `[chillacks] ${msg.from} -> ${msg.to || (msg.channel ? "#" + msg.channel : "#all")} [${n}]: ${msg.text.slice(0, 80)}`,
     );
     return json(200, { ok: true, id: msg.id, delivered_to: n });
   }
 
+  // --- POST /channel : {action: join|leave, channel} ------------------------
+  if (req.method === "POST" && url.pathname === "/channel") {
+    let p;
+    try {
+      p = JSON.parse(await readBody(req));
+    } catch {
+      return json(400, { error: "bad json" });
+    }
+    const name = AUTH ? who : p.from;
+    if (!name) return json(400, { error: "from required" });
+    const ch = normChannel(p.channel);
+    if (!ch || ch === "all")
+      return json(400, { error: "a real channel name is required (#all is implicit)" });
+    const set = channels.get(ch) || new Set();
+    if (p.action === "leave") {
+      set.delete(name);
+      if (set.size) channels.set(ch, set);
+      else channels.delete(ch); // an empty working group is a finished one
+    } else {
+      set.add(name); // join creates — a working group forms by being joined
+      channels.set(ch, set);
+    }
+    saveChannels();
+    console.error(
+      `[chillacks] ${name} ${p.action === "leave" ? "left" : "joined"} #${ch} (${set.size} member(s))`,
+    );
+    return json(200, { ok: true, channel: ch, members: [...(channels.get(ch) || [])] });
+  }
+
+  // --- POST /ack : {ref, note?} — reaches ONLY the acked message's sender ---
+  if (req.method === "POST" && url.pathname === "/ack") {
+    let p;
+    try {
+      p = JSON.parse(await readBody(req));
+    } catch {
+      return json(400, { error: "bad json" });
+    }
+    const from = AUTH ? who : p.from;
+    if (!from) return json(400, { error: "from required" });
+    const ref = Number(p.ref);
+    const orig = history.find((m) => m.id === ref);
+    if (!orig) return json(404, { error: `message ${ref} is not in live history` });
+    const msg = {
+      id: ++seq,
+      from,
+      to: orig.from, // an ack is a DM by construction — costless to the room
+      kind: "ack",
+      ref,
+      text: p.note ? String(p.note) : `ack #${ref}`,
+      ts: new Date().toISOString(),
+    };
+    archive(msg);
+    history.push(msg);
+    if (history.length > HISTORY_MAX) history.shift();
+    const n = deliver(msg);
+    console.error(`[chillacks] ${from} ack #${ref} -> ${orig.from}`);
+    return json(200, { ok: true, id: msg.id, delivered_to: n });
+  }
+
+  // --- POST /claim : {resource, release?} — a 15-minute lease --------------
+  if (req.method === "POST" && url.pathname === "/claim") {
+    let p;
+    try {
+      p = JSON.parse(await readBody(req));
+    } catch {
+      return json(400, { error: "bad json" });
+    }
+    const from = AUTH ? who : p.from;
+    if (!from) return json(400, { error: "from required" });
+    const r = String(p.resource || "").trim();
+    if (!r) return json(400, { error: "resource required" });
+    sweepClaims();
+    const held = claims.get(r);
+    if (p.release) {
+      if (held && held.by !== from)
+        return json(403, { ok: false, error: `held by ${held.by}, not you` });
+      claims.delete(r);
+      console.error(`[chillacks] ${from} released ${r}`);
+      return json(200, { ok: true, released: r });
+    }
+    if (held && held.by !== from)
+      return json(200, {
+        ok: false,
+        held_by: held.by,
+        since: new Date(held.since).toISOString(),
+      });
+    claims.set(r, { by: from, since: held ? held.since : Date.now() });
+    console.error(`[chillacks] ${from} claimed ${r}`);
+    return json(200, { ok: true, claimed: r, ttl_minutes: CLAIM_TTL_MS / 60_000 });
+  }
+
+  // --- GET /channels --------------------------------------------------------
+  if (req.method === "GET" && url.pathname === "/channels") {
+    return json(200, {
+      channels: Object.fromEntries([...channels].map(([c, s]) => [c, [...s]])),
+    });
+  }
+
   // --- GET /roster ---------------------------------------------------------
   if (req.method === "GET" && url.pathname === "/roster") {
+    sweepClaims();
     return json(200, {
       members: [...members.keys()],
       count: members.size,
       messages: history.length,
+      channels: Object.fromEntries([...channels].map(([c, s]) => [c, [...s]])),
+      claims: Object.fromEntries(
+        [...claims].map(([r, c]) => [r, { by: c.by, since: new Date(c.since).toISOString() }]),
+      ),
     });
   }
 
-  // --- GET /history?limit=N ------------------------------------------------
+  // --- GET /history?limit=N&channel=NAME -----------------------------------
   if (req.method === "GET" && url.pathname === "/history") {
     const n = Math.min(Number(url.searchParams.get("limit") || 50), HISTORY_MAX);
-    return json(200, { messages: history.slice(-n) });
+    const chq = url.searchParams.get("channel");
+    let msgs = history;
+    if (chq) {
+      const c = normChannel(chq);
+      msgs =
+        c === "all"
+          ? history.filter((m) => !m.channel && !m.to)
+          : history.filter((m) => m.channel === c);
+    }
+    return json(200, { messages: msgs.slice(-n) });
   }
 
   json(404, { error: "not found" });

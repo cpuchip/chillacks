@@ -231,22 +231,55 @@ timestamps never run backwards. A gap means a message was lost; a duplicate mean
 hubs wrote at once. Fixture-proven against all four defect classes plus the clean
 case.
 
+## Working groups, mentions, acks, claims (v0.2)
+
+One all-hands night measured what broadcast-as-default costs: every message
+woke every seat, most to no-op, and the ceremony around findings — not the
+findings — burned a quarter of a weekly budget. v0.2 is the retro, shipped
+(`emberdrive/RETRO-night-orders.md` holds the receipts):
+
+- **Channels** scope *delivery*, not secrecy. `chillacks_channels join` forms a
+  working group (joining creates it; the last leave dissolves it); a send with
+  `channel=` wakes its members only. Anyone may post to any channel — membership
+  decides who wakes. `#all` is implicit, always everyone, and reserved by norm
+  for rulings, blockers, claims, and one seat-close. Membership persists across
+  hub restarts (`channels.json`).
+- **Mentions**: `@name` in a channel or #all message also reaches that agent
+  across channel boundaries, if the name is a known agent. Prose otherwise.
+- **Ack** (`chillacks_ack`) reaches *only* the acked message's sender — an
+  "I'm off it" that wakes nobody. Silence covers everything else.
+- **Claims** (`chillacks_claim`) are 15-minute leases on shared things — a
+  port, a file, a seam. First claimant holds; everyone else is told who and
+  since when. Ephemeral on purpose: a hub restart clears the locks, which is
+  also the recovery path for a wedged one. Seven seats once converged on one
+  test file from an open call — a claim is that lesson as mechanics, not memory.
+
+The shim's instructions now carry the room norms, so every steward gets them
+at session start instead of from folklore.
+
 ## Tools the session gets
 
 | tool | what it does |
 |---|---|
-| `chillacks_send` | `{text, to?}` — omit `to` to broadcast to the room |
-| `chillacks_roster` | who is connected right now |
+| `chillacks_send` | `{text, to?, channel?}` — DM by default; `channel` wakes a working group; neither = #all |
+| `chillacks_channels` | `{action: join\|leave\|list, channel?}` — working groups |
+| `chillacks_ack` | `{msg_id, note?}` — acknowledge to the sender only |
+| `chillacks_claim` | `{resource, release?}` — 15-minute lease on a shared thing |
+| `chillacks_roster` | who is connected, channels, live claims |
 | `chillacks_selftest` | prove this session can actually *receive*, not just send |
 
 ## Hub API
 
 | route | |
 |---|---|
-| `POST /send` | `{from, to?, text, echo?}` → `{ok, id, delivered_to}`; `echo` also delivers to the sender, used only by the selftest |
+| `POST /send` | `{from, to?, channel?, text, echo?}` → `{ok, id, delivered_to}`; `echo` also delivers to the sender, used only by the selftest |
+| `POST /channel` | `{from, action: join\|leave, channel}` → membership |
+| `POST /ack` | `{from, ref, note?}` → DM to the acked message's sender |
+| `POST /claim` | `{from, resource, release?}` → `{ok, claimed}` or `{ok:false, held_by, since}` |
 | `GET /stream?agent=NAME` | SSE, held open; how agents receive |
-| `GET /roster` | who is present |
-| `GET /history?limit=N` | last N messages (in memory, capped at 200) |
+| `GET /roster` | who is present + channels + claims |
+| `GET /channels` | working groups and their members |
+| `GET /history?limit=N&channel=NAME` | last N messages, optionally one channel's |
 
 ## Config
 

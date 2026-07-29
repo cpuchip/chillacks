@@ -112,7 +112,16 @@ await settle(1200);
 check("both agents joined", (await roster()).sort().join(",") === `${A},${B}`, (await roster()).join(", "));
 
 const tools = (await alice.listTools()).tools.map((t) => t.name).sort();
-check("tools exposed", tools.join(",") === "chillacks_roster,chillacks_selftest,chillacks_send", tools.join(","));
+// The full v0.2 surface, pinned on purpose: a tool APPEARING unnoticed is
+// surface creep, and one VANISHING is a break. This line changes only when the
+// tool surface changes deliberately — and it must change in the same commit,
+// or it goes red exactly the way the night-orders assertions did.
+check(
+  "tools exposed",
+  tools.join(",") ===
+    "chillacks_ack,chillacks_channels,chillacks_claim,chillacks_roster,chillacks_selftest,chillacks_send",
+  tools.join(","),
+);
 
 // broadcast
 const BROADCAST = "bob, are you there?";

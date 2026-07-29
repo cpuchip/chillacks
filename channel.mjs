@@ -51,7 +51,7 @@ const headers = {
 };
 
 const mcp = new Server(
-  { name: "chillacks", version: "0.1.0" },
+  { name: "chillacks", version: "0.2.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -65,8 +65,29 @@ const mcp = new Server(
         `--dangerously-load-development-channels server:chillacks.`
       : `You are in a chillacks room as "${ME}". Peer messages arrive as ` +
         `<channel source="chillacks" from="NAME">. Reply with chillacks_send ` +
-        `(to="NAME" for one agent, omit "to" for the room). If asked whether ` +
-        `the channel works, use chillacks_selftest.\n\n` +
+        `(to="NAME" for a DM, channel="NAME" for a working group, neither for ` +
+        `#all). If asked whether the channel works, use chillacks_selftest.\n\n` +
+        `ROOM NORMS (ratified 2026-07-29 from the night-orders retro — ` +
+        `emberdrive/RETRO-night-orders.md). These exist because one night of ` +
+        `broadcast-default and ceremony cost 24% of a weekly budget; the ` +
+        `corrections were never the cost, the ceremony was:\n` +
+        `- DM BY DEFAULT (to=NAME). Form a working group for multi-seat work: ` +
+        `chillacks_channels join, then send with channel=NAME; @NAME in a ` +
+        `channel message also reaches that agent across channels. Broadcast to ` +
+        `#all ONLY for rulings, blockers, claims, and one seat-close.\n` +
+        `- SILENCE IS ACK. Speak only to dispute, claim, or add a measurement. ` +
+        `To acknowledge, use chillacks_ack (it reaches only the sender — the ` +
+        `room never wakes). No tributes, no confirmations, no restating another ` +
+        `seat's finding back to them.\n` +
+        `- ARTIFACT-FIRST: paste the capture + at most 3 lines of reading. ` +
+        `Prose belongs in files; the message is a path + a delta. Rulings: ` +
+        `"Ruled: X. <file> §N."\n` +
+        `- CLOSE ONCE, THEN DARK. A seat with nothing new sends nothing — not ` +
+        `a shorter version of its last message.\n` +
+        `- CLAIM BEFORE TOUCHING shared things: chillacks_claim gives a ` +
+        `15-minute lease and names the holder on conflict. Never act on an ` +
+        `open call ("whoever's awake") — claim first, and a claim in flight is ` +
+        `not a claim received until acked.\n\n` +
         `EVERY MESSAGE IS PERMANENT. The hub appends to an on-disk archive ` +
         `before delivering, so anything you send is a durable record, not a ` +
         `passing remark.\n\n` +
@@ -126,15 +147,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chillacks_send",
       description:
-        "Send a message to the chillacks room, or to one agent by name.",
+        "Send a message. DM by default (to=NAME); channel=NAME reaches a working " +
+        "group's members (plus any @NAME mentioned); neither reaches everyone " +
+        "(#all — rulings, blockers, claims, seat-closes only).",
       inputSchema: {
         type: "object",
         properties: {
           text: { type: "string", description: "The message to send" },
           to: {
             type: "string",
+            description: "Agent name for a direct message (the default mode of the room).",
+          },
+          channel: {
+            type: "string",
             description:
-              "Agent name for a direct message. Omit to broadcast to the room.",
+              "Working-group channel. Only its members (and @mentioned agents) are woken. Ignored when to= is set.",
           },
         },
         required: ["text"],
@@ -142,8 +169,53 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "chillacks_roster",
-      description: "List the agents currently connected to the room.",
+      description:
+        "List connected agents, working-group channels, and live claims.",
       inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "chillacks_channels",
+      description:
+        "Working groups: action=join creates/joins a channel, leave exits it, " +
+        "list shows all channels and members. A group forms by being joined and " +
+        "dissolves when its last member leaves.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["join", "leave", "list"] },
+          channel: { type: "string", description: "Channel name (required for join/leave)" },
+        },
+        required: ["action"],
+      },
+    },
+    {
+      name: "chillacks_ack",
+      description:
+        "Acknowledge a message by id — delivered ONLY to its sender, so the room " +
+        "never wakes. Use for claim acks and stand-downs; silence covers the rest.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          msg_id: { type: "number", description: "The id of the message being acked" },
+          note: { type: "string", description: "Optional short note (default: 'ack #id')" },
+        },
+        required: ["msg_id"],
+      },
+    },
+    {
+      name: "chillacks_claim",
+      description:
+        "Take a 15-minute lease on a shared resource (a file, a port, a seam) " +
+        "before touching it. Returns who holds it on conflict. release=true frees " +
+        "your own claim. Renew by claiming again.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          resource: { type: "string", description: "What you are claiming, e.g. ':8080' or 'internal/server/endtoend_test.go'" },
+          release: { type: "boolean", description: "Release your claim instead of taking one" },
+        },
+        required: ["resource"],
+      },
     },
     {
       name: "chillacks_selftest",
@@ -163,16 +235,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const out = await post("/send", {
         from: ME,
         to: args.to || null,
+        channel: args.channel || null,
         text: args.text,
       });
       const warn = LURKER
         ? " — NOTE: this session has no CHILLACKS_AGENT, so replies cannot reach it"
         : "";
+      const dest = args.to || (args.channel ? `#${args.channel}` : "#all");
       return {
         content: [
           {
             type: "text",
-            text: `sent as ${ME} -> ${args.to || "#room"} (${out.delivered_to} recipient(s))${warn}`,
+            text: `sent as ${ME} -> ${dest} (${out.delivered_to} recipient(s), msg #${out.id})${warn}`,
           },
         ],
       };
@@ -180,10 +254,87 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "chillacks_roster") {
       const r = await fetch(`${HUB}/roster`, { headers });
       const j = await r.json();
+      const chans = Object.entries(j.channels || {})
+        .map(([c, m]) => `#${c}[${m.join(",")}]`)
+        .join(" ");
+      const claims = Object.entries(j.claims || {})
+        .map(([res, c]) => `${res}→${c.by}`)
+        .join(" ");
       return {
         content: [
-          { type: "text", text: `present: ${j.members.join(", ") || "(nobody)"}` },
+          {
+            type: "text",
+            text:
+              `present: ${j.members.join(", ") || "(nobody)"}` +
+              (chans ? `\nchannels: ${chans}` : "") +
+              (claims ? `\nclaims: ${claims}` : ""),
+          },
         ],
+      };
+    }
+    if (name === "chillacks_channels") {
+      if (args.action === "list") {
+        const r = await fetch(`${HUB}/channels`, { headers });
+        const j = await r.json();
+        const lines = Object.entries(j.channels || {}).map(
+          ([c, m]) => `#${c}: ${m.join(", ")}`,
+        );
+        return {
+          content: [
+            { type: "text", text: lines.length ? lines.join("\n") : "(no working groups)" },
+          ],
+        };
+      }
+      const out = await post("/channel", {
+        from: ME,
+        action: args.action,
+        channel: args.channel,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${args.action === "leave" ? "left" : "joined"} #${out.channel} — members: ${out.members.join(", ") || "(none)"}`,
+          },
+        ],
+      };
+    }
+    if (name === "chillacks_ack") {
+      const out = await post("/ack", { from: ME, ref: args.msg_id, note: args.note });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `acked #${args.msg_id} — reached only its sender (${out.delivered_to} delivery)`,
+          },
+        ],
+      };
+    }
+    if (name === "chillacks_claim") {
+      const out = await post("/claim", {
+        from: ME,
+        resource: args.resource,
+        release: args.release === true,
+      });
+      if (out.released)
+        return { content: [{ type: "text", text: `released ${out.released}` }] };
+      if (out.ok)
+        return {
+          content: [
+            {
+              type: "text",
+              text: `CLAIMED ${out.claimed} — ${out.ttl_minutes}-minute lease; release when done`,
+            },
+          ],
+        };
+      return {
+        content: [
+          {
+            type: "text",
+            text: `HELD by ${out.held_by} since ${out.since} — do not touch it; DM them or wait`,
+          },
+        ],
+        isError: true,
       };
     }
     if (name === "chillacks_selftest") {
@@ -276,8 +427,15 @@ async function listen() {
             // meta keys must be identifiers — letters, digits, underscore.
             meta: {
               from: msg.from,
-              scope: msg.to ? "direct" : "room",
+              scope: msg.to
+                ? msg.kind === "ack"
+                  ? "ack"
+                  : "direct"
+                : msg.channel
+                  ? `#${msg.channel}`
+                  : "room",
               msg_id: String(msg.id),
+              ...(msg.ref ? { ref: String(msg.ref) } : {}),
             },
           },
         });
