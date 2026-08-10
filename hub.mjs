@@ -19,6 +19,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { URL } from "node:url";
 
 const HOST = process.env.CHILLACKS_HOST || "127.0.0.1";
@@ -44,7 +45,7 @@ if (!LOOPBACK && !TOKEN) {
   process.exit(2);
 }
 
-/** name -> { res, joined } */
+/** name -> { write(msg), end(), joined, authed, kind: 'sse'|'ws' } */
 const members = new Map();
 const history = [];
 const HISTORY_MAX = 200;
@@ -225,7 +226,7 @@ function dropUnauthenticated() {
   let n = 0;
   for (const [name, m] of [...members]) {
     if (m.authed) continue;
-    m.res.end();
+    m.end();
     members.delete(name);
     n++;
   }
@@ -274,10 +275,86 @@ function deliver(msg, { echo = false } = {}) {
     if (name === msg.from && !echo) continue; // normally don't echo to sender
     const m = members.get(name);
     if (!m) continue; // the room archives but does not queue — absent means missed
-    m.res.write(`data: ${JSON.stringify(msg)}\n\n`);
+    m.write(msg);
     n++;
   }
   return n; // actual deliveries, not a guess from roster size
+}
+
+// --- /ws: the native-WebSocket door (2026-08-10, Michael's ruling) ----------
+// Claude Code's Monitor tool can hold a ws subscription and be WOKEN per
+// inbound frame with zero MCP config — but its contract has no headers, so a
+// bearer must ride the Sec-WebSocket-Protocol line. A long-lived token in a
+// tool call lands in the session transcript (we measured that failure the
+// same hour this was built), so the door prefers TICKETS: POST /ws-ticket
+// with the normal header token mints a single-use 60s ticket; the ticket is
+// safe to show a transcript because it is dead the moment it is used.
+// Still zero dependencies: the server side of RFC6455 is a SHA-1 handshake,
+// an unmasked text-frame writer, and a masked-frame reader for close/ping.
+const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/** ticket -> { name, expires } */
+const wsTickets = new Map();
+
+function mintWsTicket(name) {
+  const t = crypto.randomBytes(18).toString("base64url");
+  wsTickets.set(t, { name, expires: Date.now() + 60_000 });
+  return t;
+}
+
+function takeWsTicket(t) {
+  const e = wsTickets.get(t);
+  if (!e) return null;
+  wsTickets.delete(t); // single-use, even when expired
+  return e.expires >= Date.now() ? e.name : null;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, e] of wsTickets) if (e.expires < now) wsTickets.delete(t);
+}, 30_000).unref();
+
+function wsTextFrame(str) {
+  const p = Buffer.from(String(str), "utf8");
+  let h;
+  if (p.length < 126) h = Buffer.from([0x81, p.length]);
+  else if (p.length < 65536) {
+    h = Buffer.alloc(4); h[0] = 0x81; h[1] = 126; h.writeUInt16BE(p.length, 2);
+  } else {
+    h = Buffer.alloc(10); h[0] = 0x81; h[1] = 127; h.writeBigUInt64BE(BigInt(p.length), 2);
+  }
+  return Buffer.concat([h, p]);
+}
+
+const WS_PING = Buffer.from([0x89, 0x00]);
+const WS_CLOSE = Buffer.from([0x88, 0x00]);
+
+/** Feed inbound bytes; handle close (echo + done) and ping (pong). Data
+ * frames are IGNORED — the ws door is receive-only; sends stay on POST /send
+ * where the header token already authorizes them. Returns true when the
+ * socket should close. */
+function wsConsume(state, chunk, sock) {
+  state.buf = state.buf.length ? Buffer.concat([state.buf, chunk]) : chunk;
+  for (;;) {
+    const b = state.buf;
+    if (b.length < 2) return false;
+    const opcode = b[0] & 0x0f;
+    const masked = (b[1] & 0x80) !== 0;
+    let len = b[1] & 0x7f, off = 2;
+    if (len === 126) { if (b.length < 4) return false; len = b.readUInt16BE(2); off = 4; }
+    else if (len === 127) { if (b.length < 10) return false; len = Number(b.readBigUInt64BE(2)); off = 10; }
+    const maskOff = off, dataOff = masked ? off + 4 : off;
+    if (b.length < dataOff + len) return false;
+    let payload = b.subarray(dataOff, dataOff + len);
+    if (masked) {
+      const key = b.subarray(maskOff, maskOff + 4);
+      payload = Buffer.from(payload);
+      for (let i = 0; i < payload.length; i++) payload[i] ^= key[i % 4];
+    }
+    state.buf = b.subarray(dataOff + len);
+    if (opcode === 0x8) { try { sock.write(WS_CLOSE); } catch {} return true; }
+    if (opcode === 0x9) { try { sock.write(Buffer.concat([Buffer.from([0x8a, payload.length]), payload])); } catch {} }
+    // 0xA pong and all data frames: ignored on purpose.
+  }
 }
 
 function readBody(req) {
@@ -308,6 +385,16 @@ const server = http.createServer(async (req, res) => {
   const who = identify(req);
   if (AUTH && !who) return json(401, { error: "unknown or missing token" });
 
+  // --- POST /ws-ticket : mint a single-use 60s ticket for the ws door ------
+  // Authorized by the normal header token, so the long-lived secret stays in
+  // config files; only the disposable ticket ever appears in a tool call.
+  if (req.method === "POST" && url.pathname === "/ws-ticket") {
+    if (AUTH && !who) return json(401, { error: "unknown or missing token" });
+    if (!who && !AUTH) return json(400, { error: "ws tickets need identity; run the hub with tokens" });
+    const ticket = mintWsTicket(who);
+    return json(200, { ticket, expires_in: 60, connect: `/ws (subprotocol: chillacks.ticket.${ticket})` });
+  }
+
   // --- GET /stream?agent=NAME : hold open, push messages -------------------
   if (req.method === "GET" && url.pathname === "/stream") {
     const claimed = url.searchParams.get("agent");
@@ -323,7 +410,7 @@ const server = http.createServer(async (req, res) => {
     const prior = members.get(name);
     if (prior) {
       console.error(`[chillacks] ! ${name} reconnected — evicting the previous stream`);
-      prior.res.end();
+      prior.end();
     }
 
     res.writeHead(200, {
@@ -334,7 +421,14 @@ const server = http.createServer(async (req, res) => {
     res.write(": connected\n\n");
     // Remember whether this stream proved who it was, so enabling identity
     // later can tell the pre-identity connections apart and close them.
-    members.set(name, { res, joined: Date.now(), authed: Boolean(who) });
+    members.set(name, {
+      write: (msg) => res.write(`data: ${JSON.stringify(msg)}\n\n`),
+      end: () => res.end(),
+      res,
+      joined: Date.now(),
+      authed: Boolean(who),
+      kind: "sse",
+    });
     console.error(`[chillacks] + ${name}  (${members.size} present)`);
 
     const ping = setInterval(() => res.write(": ping\n\n"), 25_000);
@@ -516,6 +610,88 @@ const server = http.createServer(async (req, res) => {
   }
 
   json(404, { error: "not found" });
+});
+
+// --- ws upgrade: GET /ws -----------------------------------------------------
+// Auth, in order: single-use ticket subprotocol (chillacks.ticket.T — the
+// Monitor path), bearer subprotocol (chillacks.bearer.TOKEN — for clients
+// that keep the token out of transcripts some other way), header token (for
+// real ws clients that can send headers, e.g. the codex bridge). The same
+// browser wall as HTTP: an Origin header means a browser sent it — refuse.
+server.on("upgrade", (req, socket) => {
+  const refuse = (code, why) => {
+    console.error(`[chillacks] ! ws refused (${why})`);
+    try { socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`); } catch {}
+    socket.destroy();
+  };
+  const url = new URL(req.url, `http://${HOST}:${PORT}`);
+  if (url.pathname !== "/ws") return refuse(404, `no upgrade at ${url.pathname}`);
+  if (req.headers.origin) return refuse(403, "Origin header present");
+  const key = req.headers["sec-websocket-key"];
+  if (!key || String(req.headers.upgrade || "").toLowerCase() !== "websocket")
+    return refuse(400, "not a websocket upgrade");
+
+  const offered = String(req.headers["sec-websocket-protocol"] || "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  let name = null, selected = null;
+  const ticketProto = offered.find((p) => p.startsWith("chillacks.ticket."));
+  const bearerProto = offered.find((p) => p.startsWith("chillacks.bearer."));
+  if (ticketProto) {
+    name = takeWsTicket(ticketProto.slice("chillacks.ticket.".length));
+    selected = ticketProto;
+    if (!name) return refuse(401, "bad, used, or expired ws ticket");
+  } else if (bearerProto) {
+    name = tokenToName.get(bearerProto.slice("chillacks.bearer.".length)) ?? null;
+    selected = bearerProto;
+    if (!name && AUTH) return refuse(401, "unknown bearer in subprotocol");
+  } else {
+    const t = req.headers["x-chillacks-token"];
+    name = t ? tokenToName.get(t) ?? null : null;
+    if (!name && AUTH) return refuse(401, "unknown or missing token");
+  }
+  if (!name) {
+    // tokenless loopback dev mode only: self-asserted, same as SSE
+    name = url.searchParams.get("agent");
+    if (!name) return refuse(400, "agent required");
+  }
+
+  const accept = crypto.createHash("sha1").update(key + WS_MAGIC).digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n` +
+      (selected ? `Sec-WebSocket-Protocol: ${selected}\r\n` : "") +
+      "\r\n",
+  );
+  socket.setNoDelay(true);
+
+  const prior = members.get(name);
+  if (prior) {
+    console.error(`[chillacks] ! ${name} reconnected (ws) — evicting the previous stream`);
+    prior.end();
+  }
+  const end = () => { try { socket.write(WS_CLOSE); } catch {} socket.destroy(); };
+  members.set(name, {
+    write: (msg) => { try { socket.write(wsTextFrame(JSON.stringify(msg))); } catch {} },
+    end,
+    joined: Date.now(),
+    authed: AUTH ? true : false,
+    kind: "ws",
+  });
+  console.error(`[chillacks] + ${name} (ws)  (${members.size} present)`);
+
+  const ping = setInterval(() => { try { socket.write(WS_PING); } catch {} }, 25_000);
+  const state = { buf: Buffer.alloc(0) };
+  socket.on("data", (chunk) => { if (wsConsume(state, chunk, socket)) end(); });
+  const bye = () => {
+    clearInterval(ping);
+    if (members.get(name)?.kind === "ws" && members.get(name)?.end === end) {
+      members.delete(name);
+      console.error(`[chillacks] - ${name} (ws)  (${members.size} present)`);
+    }
+  };
+  socket.on("close", bye);
+  socket.on("error", bye);
 });
 
 server.listen(PORT, HOST, () => {
