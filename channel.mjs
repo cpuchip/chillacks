@@ -31,6 +31,16 @@ import os from "node:os";
 // being absent.
 const AGENT = process.env.CHILLACKS_AGENT || "";
 const LURKER = !AGENT;
+// SPEAK-ONLY (2026-08-10): a client that cannot consume our push — the room's
+// inbound path is `notifications/claude/channel`, a Claude Code extension — must
+// NOT open the SSE stream. The hub gives one stream per seat name and the newest
+// evicts the oldest, so a deaf client joining as `codex` would silently steal
+// presence from whatever actually hears for that seat (its ws subscriber), and
+// DMs would land in a stream nobody reads. Speak-only keeps the tools, skips the
+// ear, and leaves presence to the real listener. Non-Claude MCP clients (codex,
+// and anything else with no push handler) should set CHILLACKS_SPEAK_ONLY=1 and
+// catch up with chillacks_recent.
+const SPEAK_ONLY = /^(1|true|yes)$/i.test(process.env.CHILLACKS_SPEAK_ONLY || "");
 const ME = AGENT || `lurker-${os.hostname()}-${process.pid}`;
 
 // The room has a point man. Peers escalate decisions to the foreman rather than
@@ -174,6 +184,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} },
     },
     {
+      name: "chillacks_recent",
+      description:
+        "Read what the room has said lately — the catch-up path for a client " +
+        "that does not receive live pushes (speak-only mode). Returns the last " +
+        "N messages, optionally just one channel's.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "How many messages (default 20, max 200)" },
+          channel: { type: "string", description: "Only this channel; 'all' for the broadcast lane" },
+        },
+      },
+    },
+    {
       name: "chillacks_channels",
       description:
         "Working groups: action=join creates/joins a channel, leave exits it, " +
@@ -268,6 +292,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               `present: ${j.members.join(", ") || "(nobody)"}` +
               (chans ? `\nchannels: ${chans}` : "") +
               (claims ? `\nclaims: ${claims}` : ""),
+          },
+        ],
+      };
+    }
+    if (name === "chillacks_recent") {
+      const n = Math.min(Math.max(Number(args.limit) || 20, 1), 200);
+      const q = new URLSearchParams({ limit: String(n) });
+      if (args.channel) q.set("channel", String(args.channel));
+      const r = await fetch(`${HUB}/history?${q}`, { headers });
+      const j = await r.json();
+      const lines = (j.messages || []).map((m) => {
+        const dest = m.to ? `-> ${m.to}` : m.channel ? `#${m.channel}` : "#all";
+        return `[${m.id}] ${m.from} ${dest}: ${m.text}`;
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: lines.length
+              ? `last ${lines.length} message(s):\n` + lines.join("\n")
+              : "the room has said nothing in this scope",
           },
         ],
       };
@@ -386,6 +431,11 @@ if (LURKER) {
   // never lists a session that cannot hear.
   console.error(
     `[chillacks] no CHILLACKS_AGENT — lurking (tools only, not in the room)`,
+  );
+} else if (SPEAK_ONLY) {
+  console.error(
+    `[chillacks] ${ME} SPEAK-ONLY — tools live, no stream (presence belongs to ` +
+      `this seat's real listener; catch up with chillacks_recent)`,
   );
 } else {
   console.error(`[chillacks] ${ME} -> ${HUB}`);
