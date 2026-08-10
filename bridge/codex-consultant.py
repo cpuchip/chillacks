@@ -76,11 +76,27 @@ def consult(msg: dict) -> str:
               + (f" in #{msg['channel']}" if msg.get("channel") else "")
               + f"]\n{msg.get('text','')}")
     sid = SESSION_FILE.read_text(encoding="utf-8").strip() if SESSION_FILE.is_file() else ""
-    base = ["codex", "exec", "--skip-git-repo-check", "-s", "read-only",
+    import shutil
+    codex = shutil.which("codex")  # Windows: the npm shim is codex.CMD —
+    if not codex:                  # bare "codex" is WinError 2 from Python
+        raise RuntimeError("codex CLI not on PATH")
+    # Prefer the real .exe over the npm .cmd shim: a .cmd runs through
+    # cmd.exe, which RE-TOKENIZES argv — the first live consult's question
+    # was shredded at its semicolons and the model saw only the preamble
+    # (it answered "Understood" in 5s). The exe lives in the vendor dir.
+    if codex.lower().endswith((".cmd", ".bat")):
+        exe = next(Path(codex).parent.glob(
+            "node_modules/@openai/codex/node_modules/*/vendor/*/bin/codex.exe"), None)
+        if exe:
+            codex = str(exe)
+    base = [codex, "exec", "--skip-git-repo-check", "-s", "read-only",
             "--json", "-o", str(out)]
-    argv = base + (["resume", sid, prompt] if sid else [prompt])
+    # Prompt rides STDIN ("-"), never argv: immune to cmd.exe re-parsing,
+    # and writing-then-closing the pipe gives codex its EOF (an OPEN stdin
+    # pipe hangs it forever — both failure modes measured today).
+    argv = base + (["resume", sid, "-"] if sid else ["-"])
     p = subprocess.run(argv, cwd=WORKDIR, capture_output=True, text=True,
-                       encoding="utf-8", stdin=subprocess.DEVNULL, timeout=600)
+                       encoding="utf-8", input=prompt, timeout=600)
     # session id for continuity: thread.started event carries it
     for line in (p.stdout or "").splitlines():
         try:
@@ -121,7 +137,13 @@ def serve_once() -> None:
         if msg.get("from") == "codex":
             continue
         log(f"consult from {msg.get('from')}: {str(msg.get('text',''))[:80]}")
-        reply = consult(msg)
+        try:
+            reply = consult(msg)
+        except Exception as e:
+            # a consult failure must not read as a CONNECTION failure — the
+            # first WinError here dropped the ws and orphaned the question
+            log(f"! consult raised: {e}")
+            reply = ""
         if reply:
             # DM back to the asker; channel messages answer into the channel
             n = post_send(reply, to=None if msg.get("channel") else msg.get("from"))
