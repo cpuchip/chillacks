@@ -392,7 +392,13 @@ const server = http.createServer(async (req, res) => {
     if (AUTH && !who) return json(401, { error: "unknown or missing token" });
     if (!who && !AUTH) return json(400, { error: "ws tickets need identity; run the hub with tokens" });
     const ticket = mintWsTicket(who);
-    return json(200, { ticket, expires_in: 60, connect: `/ws (subprotocol: chillacks.ticket.${ticket})` });
+    return json(200, {
+      ticket, expires_in: 60,
+      // Offer the constant marker FIRST so the 101 echoes `chillacks`, not
+      // the credential; the ticket rides second and is consumed, never echoed.
+      subprotocols: ["chillacks", `chillacks.ticket.${ticket}`],
+      connect: `/ws (subprotocols: chillacks, chillacks.ticket.${ticket})`,
+    });
   }
 
   // --- GET /stream?agent=NAME : hold open, push messages -------------------
@@ -631,19 +637,23 @@ server.on("upgrade", (req, socket) => {
   if (!key || String(req.headers.upgrade || "").toLowerCase() !== "websocket")
     return refuse(400, "not a websocket upgrade");
 
+  // Two auth paths, both keeping the CREDENTIAL out of anything logged or
+  // echoed (codex/GPT-5.6's consult, 2026-08-10): a single-use ticket in the
+  // subprotocol (the Monitor path — no headers available there), or a header
+  // token for real ws clients. A LONG-LIVED bearer in the subprotocol was
+  // removed: Sec-WebSocket-Protocol is commonly logged and echoed, so it
+  // widened a durable credential's exposure for no consumer's benefit.
+  // What we echo back is the CONSTANT marker `chillacks`, never the ticket —
+  // the ticket is single-use and already spent by the time we reply, but
+  // echoing a constant leaks nothing even in principle.
   const offered = String(req.headers["sec-websocket-protocol"] || "")
     .split(",").map((s) => s.trim()).filter(Boolean);
-  let name = null, selected = null;
+  let name = null;
+  const selected = offered.includes("chillacks") ? "chillacks" : null;
   const ticketProto = offered.find((p) => p.startsWith("chillacks.ticket."));
-  const bearerProto = offered.find((p) => p.startsWith("chillacks.bearer."));
   if (ticketProto) {
     name = takeWsTicket(ticketProto.slice("chillacks.ticket.".length));
-    selected = ticketProto;
     if (!name) return refuse(401, "bad, used, or expired ws ticket");
-  } else if (bearerProto) {
-    name = tokenToName.get(bearerProto.slice("chillacks.bearer.".length)) ?? null;
-    selected = bearerProto;
-    if (!name && AUTH) return refuse(401, "unknown bearer in subprotocol");
   } else {
     const t = req.headers["x-chillacks-token"];
     name = t ? tokenToName.get(t) ?? null : null;
