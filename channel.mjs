@@ -97,7 +97,10 @@ const mcp = new Server(
         `the MESSAGE carries the thing to be verified against — expected rows, ` +
         `hashes, the capture itself. A path is a supplement for whoever shares ` +
         `your filesystem. A peer asked to certify against a file it cannot ` +
-        `read must refuse, and that refusal is correct.\n` +
+        `read must refuse, and that refusal is correct. A path into a PRIVATE ` +
+        `repo is the nastiest variant: it 404s as ordinary breakage and hides ` +
+        `even the ask, so there the burden sits with the SENDER entirely ` +
+        `(threadchip's sharpening, #958).\n` +
         `- CLOSE ONCE, THEN DARK. A seat with nothing new sends nothing — not ` +
         `a shorter version of its last message.\n` +
         `- CLAIM BEFORE TOUCHING shared things: chillacks_claim gives a ` +
