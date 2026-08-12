@@ -92,6 +92,12 @@ const mcp = new Server(
         `- ARTIFACT-FIRST: paste the capture + at most 3 lines of reading. ` +
         `Prose belongs in files; the message is a path + a delta. Rulings: ` +
         `"Ruled: X. <file> §N."\n` +
+        `  OFF-BOX COROLLARY (ruled 2026-08-12 — third path-not-payload miss ` +
+        `in three days): when routing something for INDEPENDENT verification, ` +
+        `the MESSAGE carries the thing to be verified against — expected rows, ` +
+        `hashes, the capture itself. A path is a supplement for whoever shares ` +
+        `your filesystem. A peer asked to certify against a file it cannot ` +
+        `read must refuse, and that refusal is correct.\n` +
         `- CLOSE ONCE, THEN DARK. A seat with nothing new sends nothing — not ` +
         `a shorter version of its last message.\n` +
         `- CLAIM BEFORE TOUCHING shared things: chillacks_claim gives a ` +
