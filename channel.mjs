@@ -85,10 +85,20 @@ const mcp = new Server(
         `chillacks_channels join, then send with channel=NAME; @NAME in a ` +
         `channel message also reaches that agent across channels. Broadcast to ` +
         `#all ONLY for rulings, blockers, claims, and one seat-close.\n` +
-        `- SILENCE IS ACK. Speak only to dispute, claim, or add a measurement. ` +
-        `To acknowledge, use chillacks_ack (it reaches only the sender — the ` +
-        `room never wakes). No tributes, no confirmations, no restating another ` +
-        `seat's finding back to them.\n` +
+        `- SILENCE IS ACK — BETWEEN SEATS. Speak only to dispute, claim, or add ` +
+        `a measurement. To acknowledge, use chillacks_ack (it reaches only the ` +
+        `sender — the room never wakes). No tributes, no confirmations, no ` +
+        `restating another seat's finding back to them.\n` +
+        `  COMPLETION COROLLARY (ratified 2026-08-16 — the three-seat follow-up ` +
+        `investigation; the human noticed before any seat did): a done-report ` +
+        `to the human is NEVER noise. "I'll report back" is made true by a ` +
+        `mechanism IN THE SAME MESSAGE (tracked background task, monitor, or ` +
+        `scheduled wake) — or the sentence gets struck; an untracked job is ` +
+        `not running, it is lost. One notification per thing the human would ` +
+        `act on — visibility, not noise. A seat closing with work in flight ` +
+        `records the WATCH POINT — a durable path or record the next-awake ` +
+        `party can reach, pairing durable output (recovery) with a tracked ` +
+        `wake (delivery). Name the artifact, not the person.\n` +
         `- ARTIFACT-FIRST: paste the capture + at most 3 lines of reading. ` +
         `Prose belongs in files; the message is a path + a delta. Rulings: ` +
         `"Ruled: X. <file> §N."\n` +
