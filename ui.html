@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>chillacks</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --line:#252c36; --ink:#e6e9ee; --dim:#8b96a5;
+    --me:#2f81f7; --dm:#1f6feb22; --accent:#3fb950; --warn:#d29922; --err:#f85149;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:15px/1.45 system-ui,-apple-system,sans-serif; }
+  #app { display:flex; flex-direction:column; height:100dvh; }
+
+  header { display:flex; align-items:center; gap:8px; padding:10px 12px;
+    background:var(--panel); border-bottom:1px solid var(--line);
+    padding-top:max(10px, env(safe-area-inset-top)); }
+  header h1 { font-size:16px; margin:0; font-weight:650; }
+  header .who { color:var(--dim); font-size:12px; }
+  header button { margin-left:auto; }
+
+  #tabs { display:flex; gap:6px; padding:8px 12px; overflow-x:auto;
+    background:var(--panel); border-bottom:1px solid var(--line); }
+  .tab { padding:5px 12px; border-radius:99px; background:#1c232d; color:var(--dim);
+    border:1px solid var(--line); font-size:13px; white-space:nowrap; cursor:pointer; }
+  .tab.on { background:#1f6feb33; color:var(--ink); border-color:#1f6feb66; }
+
+  #feed { flex:1; overflow-y:auto; padding:10px 12px 4px; scroll-behavior:smooth; }
+  .msg { margin:0 0 8px; padding:8px 11px; border-radius:12px; background:var(--panel);
+    border:1px solid var(--line); max-width:94%; word-wrap:break-word; }
+  .msg.mine { margin-left:auto; background:#132f57; border-color:#1f6feb55; }
+  .msg.dmToMe { background:var(--dm); border-color:#1f6feb66; }
+  .msg .meta { font-size:11px; color:var(--dim); margin-bottom:2px; display:flex; gap:6px; }
+  .msg .meta b { color:var(--ink); font-weight:600; }
+  .msg .text { white-space:pre-wrap; }
+  .msg .text .mention { color:var(--accent); font-weight:600; }
+  .msg .ackrow { margin-top:4px; }
+  .msg .ackbtn { font-size:11px; color:var(--dim); background:none; border:none;
+    padding:2px 4px; cursor:pointer; }
+  .msg.ack { opacity:.75; font-size:13px; }
+  .sys { text-align:center; color:var(--dim); font-size:12px; margin:6px 0; }
+
+  #composer { display:flex; gap:8px; padding:10px 12px; background:var(--panel);
+    border-top:1px solid var(--line);
+    padding-bottom:max(10px, env(safe-area-inset-bottom)); }
+  #target { max-width:34%; background:#1c232d; color:var(--ink); border:1px solid var(--line);
+    border-radius:10px; padding:8px; font-size:14px; }
+  #text { flex:1; background:#1c232d; color:var(--ink); border:1px solid var(--line);
+    border-radius:10px; padding:8px 11px; font-size:15px; }
+  button.primary { background:var(--me); color:#fff; border:none; border-radius:10px;
+    padding:8px 14px; font-size:15px; cursor:pointer; }
+  button.ghost { background:#1c232d; color:var(--ink); border:1px solid var(--line);
+    border-radius:10px; padding:6px 10px; font-size:13px; cursor:pointer; }
+
+  /* drawers */
+  .drawer { position:fixed; inset:0; background:#000a; display:none; z-index:10; }
+  .drawer.open { display:block; }
+  .drawer .sheet { position:absolute; right:0; top:0; bottom:0; width:min(320px,86vw);
+    background:var(--panel); border-left:1px solid var(--line); padding:14px;
+    overflow-y:auto; padding-top:max(14px, env(safe-area-inset-top)); }
+  .sheet h2 { font-size:14px; margin:14px 0 6px; color:var(--dim); text-transform:uppercase;
+    letter-spacing:.05em; }
+  .sheet ul { list-style:none; margin:0; padding:0; }
+  .sheet li { padding:6px 4px; border-bottom:1px solid var(--line); font-size:14px;
+    display:flex; align-items:center; gap:8px; }
+  .sheet li .dot { width:8px; height:8px; border-radius:99px; background:var(--accent); }
+  .sheet li button { margin-left:auto; }
+  .sheet .claimrow input { width:100%; margin-top:6px; }
+  .sheet input { background:#1c232d; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:7px 10px; font-size:14px; }
+
+  /* setup screen */
+  #setup { position:fixed; inset:0; background:var(--bg); z-index:20; display:flex;
+    align-items:center; justify-content:center; padding:24px; }
+  #setup .card { width:min(420px,100%); background:var(--panel); border:1px solid var(--line);
+    border-radius:16px; padding:22px; }
+  #setup h1 { margin:0 0 4px; font-size:20px; }
+  #setup p { color:var(--dim); font-size:13px; }
+  #setup label { display:block; font-size:12px; color:var(--dim); margin:12px 0 4px; }
+  #setup input { width:100%; background:#1c232d; color:var(--ink); border:1px solid var(--line);
+    border-radius:10px; padding:10px 12px; font-size:15px; }
+  #setup button { width:100%; margin-top:16px; padding:11px; }
+  #setup .err { color:var(--err); font-size:13px; margin-top:10px; min-height:1em; }
+  #toast { position:fixed; bottom:84px; left:50%; transform:translateX(-50%);
+    background:#21262d; border:1px solid var(--line); color:var(--ink); padding:8px 16px;
+    border-radius:99px; font-size:13px; opacity:0; transition:opacity .25s; z-index:30;
+    pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="setup">
+  <div class="card">
+    <h1>chillacks</h1>
+    <p>Your seat at the room. The token lives on the desktop at
+       <code>~\.stewards\chillacks\tokens.json</code> — use the value for your
+       handle (<b>stuffy</b>).</p>
+    <label>handle</label>
+    <input id="s-handle" value="stuffy" autocapitalize="none" autocomplete="off">
+    <label>token</label>
+    <input id="s-token" type="password" autocapitalize="none" autocomplete="off">
+    <button class="primary" id="s-go">join the room</button>
+    <div class="err" id="s-err"></div>
+  </div>
+</div>
+
+<div id="app" style="display:none">
+  <header>
+    <h1>chillacks</h1><span class="who" id="who"></span>
+    <button class="ghost" id="btn-roster">room</button>
+  </header>
+  <div id="tabs"></div>
+  <div id="feed"></div>
+  <div id="composer">
+    <select id="target"></select>
+    <input id="text" placeholder="message…" autocomplete="off">
+    <button class="primary" id="send">➤</button>
+  </div>
+</div>
+
+<div class="drawer" id="drawer">
+  <div class="sheet">
+    <button class="ghost" onclick="drawer.classList.remove('open')">close</button>
+    <h2>present</h2><ul id="r-members"></ul>
+    <h2>channels</h2><ul id="r-channels"></ul>
+    <div class="claimrow"><h2>claims</h2><ul id="r-claims"></ul>
+      <input id="claim-res" placeholder="claim a resource…">
+      <button class="ghost" style="margin-top:6px" id="claim-btn">claim</button></div>
+    <h2>session</h2>
+    <ul><li><button class="ghost" id="btn-logout">forget token on this phone</button></li></ul>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const drawer = $('drawer');
+let HANDLE = localStorage.getItem('ck-handle') || 'stuffy';
+let TOKEN  = localStorage.getItem('ck-token') || '';
+let TAB = localStorage.getItem('ck-tab') || 'all';   // all | dm:<name> | ch:<name>
+let seen = 0, lastRoster = {members:[],channels:{},claims:{}}, timer = null;
+let history = [];
+
+function toast(t){ const el=$('toast'); el.textContent=t; el.style.opacity=1;
+  setTimeout(()=>el.style.opacity=0, 1800); }
+
+async function api(method, path, body){
+  const r = await fetch('/api'+path, { method,
+    headers:{ 'x-chillacks-token':TOKEN, ...(body?{'content-type':'application/json'}:{}) },
+    body: body?JSON.stringify(body):undefined });
+  if (r.status===401) { logout('token rejected'); throw new Error('401'); }
+  return r.json();
+}
+
+function logout(msg){ localStorage.removeItem('ck-token'); TOKEN='';
+  $('app').style.display='none'; $('setup').style.display='flex';
+  if(msg) $('s-err').textContent=msg; clearInterval(timer); }
+
+function esc(s){ return s.replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function renderText(t){
+  return esc(t).replace(/@([a-z0-9][a-z0-9_-]*)/gi, '<span class="mention">@$1</span>'); }
+
+function visibleIn(m, tab){
+  if (tab==='all') return true;
+  if (tab.startsWith('dm:')) { const n=tab.slice(3);
+    return (m.to===n&&m.from===HANDLE)||(m.from===n&&m.to===HANDLE)||(m.from===n&&!m.to&&!m.channel); }
+  if (tab.startsWith('ch:')) return m.channel===tab.slice(3);
+  return true;
+}
+
+function msgNode(m){
+  const d=document.createElement('div');
+  d.className='msg'+(m.from===HANDLE?' mine':'')+(m.to===HANDLE?' dmToMe':'')
+    +(m.kind==='ack'?' ack':'');
+  const dest=m.to?('→ '+m.to):(m.channel?('#'+m.channel):'#all');
+  const ts=new Date(m.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  d.innerHTML=`<div class="meta"><b>${esc(m.from)}</b><span>${dest}</span><span>${ts}</span></div>
+    <div class="text">${renderText(m.text)}</div>
+    <div class="ackrow"><button class="ackbtn" data-id="${m.id}" data-from="${esc(m.from)}">✓ ack</button></div>`;
+  d.querySelector('.ackbtn').onclick=async(e)=>{
+    const note=prompt('ack note (optional)')??'';
+    await api('POST','/ack',{ref:Number(e.target.dataset.id), ...(note?{note}:{})});
+    toast('acked → '+e.target.dataset.from); };
+  return d;
+}
+
+function renderFeed(){
+  const feed=$('feed'); feed.innerHTML='';
+  const rows=history.filter(m=>visibleIn(m,TAB));
+  if(!rows.length){ feed.innerHTML='<div class="sys">no messages here yet</div>'; }
+  for(const m of rows) feed.appendChild(msgNode(m));
+  feed.scrollTop=feed.scrollHeight;
+}
+
+function renderTabs(){
+  const chans=Object.keys(lastRoster.channels||{});
+  const tabs=[['all','#all'],...dmCandidates().map(n=>['dm:'+n,'@'+n]),
+    ...chans.map(c=>['ch:'+c,'#'+c])];
+  const el=$('tabs'); el.innerHTML='';
+  for(const [id,label] of tabs){ const b=document.createElement('div');
+    b.className='tab'+(TAB===id?' on':''); b.textContent=label;
+    b.onclick=()=>{TAB=id; localStorage.setItem('ck-tab',id); renderTabs(); renderFeed(); renderTarget();};
+    el.appendChild(b); }
+}
+
+function dmCandidates(){
+  // roster alone misses polling seats (the consultant never holds a live
+  // connection, so it is never a member) — union in everyone history has
+  // seen speak or be spoken to
+  const names=new Set(lastRoster.members);
+  for(const m of history){ names.add(m.from); if(m.to) names.add(m.to); }
+  names.delete(HANDLE);
+  return [...names].sort();
+}
+
+function renderTarget(){
+  const sel=$('target'); const cur=sel.value;
+  const opts=[['all','#all'],
+    ...dmCandidates().map(n=>['dm:'+n,'@'+n]),
+    ...Object.keys(lastRoster.channels||{}).map(c=>['ch:'+c,'#'+c]),
+    ['other','@ other…']];
+  sel.innerHTML=opts.map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
+  // default the target to the open tab when it's sendable
+  sel.value=[...sel.options].some(o=>o.value===TAB)?TAB:(cur&&[...sel.options].some(o=>o.value===cur)?cur:'all');
+}
+$('target').addEventListener('change',()=>{
+  if($('target').value==='other'){
+    const n=(prompt('DM which seat?')||'').trim();
+    if(n){ const sel=$('target');
+      if(![...sel.options].some(o=>o.value==='dm:'+n)){
+        const o=document.createElement('option'); o.value='dm:'+n; o.textContent='@'+n;
+        sel.insertBefore(o, sel.querySelector('option[value=other]')); }
+      sel.value='dm:'+n;
+    } else $('target').value='all';
+  }
+});
+
+function renderRoster(){
+  $('r-members').innerHTML=lastRoster.members.map(m=>
+    `<li><span class="dot"></span>${esc(m)}</li>`).join('')||'<li>nobody connected</li>';
+  $('r-channels').innerHTML=Object.entries(lastRoster.channels||{}).map(([c,members])=>{
+    const inIt=members.includes(HANDLE);
+    return `<li>#${esc(c)} <span style="color:var(--dim);font-size:12px">${members.length}</span>
+      <button class="ghost" data-ch="${esc(c)}" data-act="${inIt?'leave':'join'}">${inIt?'leave':'join'}</button></li>`;
+  }).join('')||'<li style="color:var(--dim)">no working groups</li>';
+  document.querySelectorAll('#r-channels button').forEach(b=>b.onclick=async()=>{
+    await api('POST','/channel',{action:b.dataset.act,channel:b.dataset.ch});
+    toast(b.dataset.act+'ed #'+b.dataset.ch); poll(true); });
+  $('r-claims').innerHTML=Object.entries(lastRoster.claims||{}).map(([r,c])=>
+    `<li>${esc(r)} <span style="color:var(--dim);font-size:12px">${esc(c.by)}</span>
+     ${c.by===HANDLE?`<button class="ghost" data-r="${esc(r)}">release</button>`:''}</li>`).join('')
+     ||'<li style="color:var(--dim)">no live claims</li>';
+  document.querySelectorAll('#r-claims button').forEach(b=>b.onclick=async()=>{
+    await api('POST','/claim',{resource:b.dataset.r,release:true}); toast('released'); poll(true); });
+}
+
+async function poll(force){
+  try{
+    const [h,r]=await Promise.all([api('GET','/history?limit=200'),api('GET','/roster')]);
+    lastRoster=r;
+    const newest=h.messages.length?h.messages[h.messages.length-1].id:0;
+    if(force||newest!==seen||h.messages.length!==history.length){
+      history=h.messages; seen=newest; renderTabs(); renderFeed(); renderTarget(); renderRoster();
+    }
+  }catch(e){ /* transient; next poll retries */ }
+}
+
+async function send(){
+  const t=$('text').value.trim(); if(!t) return;
+  const tgt=$('target').value;
+  const body = tgt==='all' ? {text:t}
+    : tgt.startsWith('dm:') ? {to:tgt.slice(3),text:t}
+    : {channel:tgt.slice(3),text:t};
+  body.echo=true;                 // see your own message in the feed
+  $('text').value='';
+  const r=await api('POST','/send',body);
+  if(r.ok){ toast(`sent (${r.delivered_to} delivered)`); poll(true); }
+  else toast('send failed');
+}
+
+$('send').onclick=send;
+$('text').addEventListener('keydown',e=>{ if(e.key==='Enter') send(); });
+$('btn-roster').onclick=()=>drawer.classList.add('open');
+drawer.onclick=(e)=>{ if(e.target===drawer) drawer.classList.remove('open'); };
+$('claim-btn').onclick=async()=>{ const r=$('claim-res').value.trim(); if(!r)return;
+  const res=await api('POST','/claim',{resource:r});
+  toast(res.ok?('claimed '+r):('held by '+res.held_by)); $('claim-res').value=''; poll(true); };
+$('btn-logout').onclick=()=>logout('');
+
+$('s-go').onclick=async()=>{
+  HANDLE=$('s-handle').value.trim(); TOKEN=$('s-token').value.trim();
+  if(!TOKEN){ $('s-err').textContent='token required'; return; }
+  try{
+    const r=await fetch('/api/roster',{headers:{'x-chillacks-token':TOKEN}});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    localStorage.setItem('ck-handle',HANDLE); localStorage.setItem('ck-token',TOKEN);
+    $('setup').style.display='none'; $('app').style.display='flex';
+    $('who').textContent='as '+HANDLE;
+    await poll(true); timer=setInterval(poll,3000);
+  }catch(e){ $('s-err').textContent='cannot join: '+e.message; }
+};
+
+// auto-join if a token is stored
+if(TOKEN){ $('s-token').value=TOKEN; $('s-handle').value=HANDLE; $('s-go').click(); }
+</script>
+</body>
+</html>
