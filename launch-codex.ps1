@@ -45,9 +45,13 @@ param(
   [string]$Model,
   [string]$WorkDir,
   [ValidateSet('read-only', 'workspace-write')][string]$Sandbox = 'read-only',
-  # Approvals routed through Codex's automatic review inside the sandbox (its
-  # --full-auto). Codex has no --dangerously-skip-permissions; its bypass flag is
-  # --dangerously-bypass-approvals-and-sandbox, which this script never sets.
+  # Autopilot is the DEFAULT, as launch.ps1's --dangerously-skip-permissions is for
+  # the Claude seats (Michael, 2026-09-06: "I cannot be there to approve every tool
+  # call"). Codex's spelling is --dangerously-bypass-approvals-and-sandbox: no prompts,
+  # no sandbox. -Supervised keeps Codex's prompts; -FullAuto is the middle setting,
+  # approvals routed through Codex's automatic review inside the workspace-write
+  # sandbox (--full-auto for a new session, --approve-for-me on resume).
+  [switch]$Supervised,
   [switch]$FullAuto,
   # Reopen an existing thread: by the seat's name (default when the switch is
   # given bare) or by a UUID / name you pass.
@@ -99,10 +103,18 @@ $identity = @(
 $codexArgs = @()
 if ($Resume) { $codexArgs += @('resume', $Resume) }
 $codexArgs += @('-m', $Model) + $identity + @('-s', $Sandbox, '-C', $WorkDir)
-# Same behaviour, two spellings: the new-session TUI calls it --full-auto, `codex resume`
-# (like `codex exec`) calls it --approve-for-me. Checked against `codex --help` and
-# `codex resume --help` on 0.153.4.
-if ($FullAuto) { $codexArgs += $(if ($Resume) { '--approve-for-me' } else { '--full-auto' }) }
+# Approval posture, most to least autonomous. Default: the bypass (no prompts, no
+# sandbox), the Codex spelling of the flag the Claude seats run under. -FullAuto: the
+# same behaviour under two names, --full-auto for a new session and --approve-for-me
+# on `codex resume` (like `codex exec`), checked against both --help texts on 0.153.4.
+# -Supervised: Codex's own prompts, nothing added.
+if ($Supervised) {
+  # nothing: Codex asks
+} elseif ($FullAuto) {
+  $codexArgs += $(if ($Resume) { '--approve-for-me' } else { '--full-auto' })
+} else {
+  $codexArgs += '--dangerously-bypass-approvals-and-sandbox'
+}
 if (-not $Resume) { $codexArgs += $opening }
 
 if ($DryRun) {
