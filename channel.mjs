@@ -94,11 +94,12 @@ const mcp = new Server(
         `the foreman (${FOREMAN}), never #all (ruled 2026-09-06 by Michael): a ` +
         `broadcast wakes every idle session, and each wake of a session idle an ` +
         `hour or more is a full cache miss. The foreman relays what a seat needs.\n` +
-        `- PULL SEATS (astra, sol, and any speak-only Codex seat): they hold no ` +
-        `stream, so a DM to them is archived by the hub and read on their next ` +
-        `wake via chillacks_recent; "0 recipient(s)" to those names is expected, ` +
-        `not a failure. A review request to them also goes to a file they can ` +
-        `read (their durable channel), named in the DM.\n` +
+        `- BRIDGED SEATS (astra, sol: Codex): their process is speak-only, and a ` +
+        `listener (codex-bridge) holds their stream and delivers your DM into the ` +
+        `live thread, waking it; while it runs they are ordinary seats. When it is ` +
+        `not running, "0 recipient(s)" means archived, read on their next wake ` +
+        `via chillacks_recent, not lost. A review request to them also goes to a ` +
+        `file they can read (their durable channel), named in the DM.\n` +
         `- SILENCE IS ACK — BETWEEN SEATS. Speak only to dispute, claim, or add ` +
         `a measurement. To acknowledge, use chillacks_ack (it reaches only the ` +
         `sender — the room never wakes). No tributes, no confirmations, no ` +
@@ -301,7 +302,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const dest = args.to || (args.channel ? `#${args.channel}` : "#all");
       const pull =
         args.to && out.delivered_to === 0 && PULL_SEATS.has(args.to)
-          ? ` — archived; ${args.to} is a pull seat (speak-only) and reads it on its next wake`
+          ? ` — archived; ${args.to} is a bridged seat whose bridge is not running; it reads it on its next wake`
           : "";
       return {
         content: [
