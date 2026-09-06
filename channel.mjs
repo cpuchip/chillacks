@@ -47,6 +47,12 @@ const ME = AGENT || `lurker-${os.hostname()}-${process.pid}`;
 // stopping to ask their human — a system that needs a human watching every
 // thread and clicking accept is a system that stalls.
 const FOREMAN = process.env.CHILLACKS_FOREMAN || "workspace-basecamp";
+// Pull seats hold no stream (speak-only Codex sessions); the hub archives DMs to
+// them and they catch up with chillacks_recent. Named so a sender reads
+// "0 recipients" to one of them as archived, not lost.
+const PULL_SEATS = new Set(
+  (process.env.CHILLACKS_PULL_SEATS || "astra,sol,codex").split(",").map((x) => x.trim()).filter(Boolean),
+);
 const IS_FOREMAN = !LURKER && ME === FOREMAN;
 const HUB =
   process.env.CHILLACKS_HUB ||
@@ -84,7 +90,15 @@ const mcp = new Server(
         `- DM BY DEFAULT (to=NAME). Form a working group for multi-seat work: ` +
         `chillacks_channels join, then send with channel=NAME; @NAME in a ` +
         `channel message also reaches that agent across channels. Broadcast to ` +
-        `#all ONLY for rulings, blockers, claims, and one seat-close.\n` +
+        `#all ONLY for rulings and blockers. Claims and seat-closes are a DM to ` +
+        `the foreman (${FOREMAN}), never #all (ruled 2026-09-06 by Michael): a ` +
+        `broadcast wakes every idle session, and each wake of a session idle an ` +
+        `hour or more is a full cache miss. The foreman relays what a seat needs.\n` +
+        `- PULL SEATS (astra, sol, and any speak-only Codex seat): they hold no ` +
+        `stream, so a DM to them is archived by the hub and read on their next ` +
+        `wake via chillacks_recent; "0 recipient(s)" to those names is expected, ` +
+        `not a failure. A review request to them also goes to a file they can ` +
+        `read (their durable channel), named in the DM.\n` +
         `- SILENCE IS ACK — BETWEEN SEATS. Speak only to dispute, claim, or add ` +
         `a measurement. To acknowledge, use chillacks_ack (it reaches only the ` +
         `sender — the room never wakes). No tributes, no confirmations, no ` +
@@ -178,7 +192,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Send a message. DM by default (to=NAME); channel=NAME reaches a working " +
         "group's members (plus any @NAME mentioned); neither reaches everyone " +
-        "(#all — rulings, blockers, claims, seat-closes only).",
+        "(#all — rulings and blockers only; claims and seat-closes are a DM to the foreman).",
       inputSchema: {
         type: "object",
         properties: {
@@ -285,11 +299,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ? " — NOTE: this session has no CHILLACKS_AGENT, so replies cannot reach it"
         : "";
       const dest = args.to || (args.channel ? `#${args.channel}` : "#all");
+      const pull =
+        args.to && out.delivered_to === 0 && PULL_SEATS.has(args.to)
+          ? ` — archived; ${args.to} is a pull seat (speak-only) and reads it on its next wake`
+          : "";
       return {
         content: [
           {
             type: "text",
-            text: `sent as ${ME} -> ${dest} (${out.delivered_to} recipient(s), msg #${out.id})${warn}`,
+            text: `sent as ${ME} -> ${dest} (${out.delivered_to} recipient(s), msg #${out.id})${warn}${pull}`,
           },
         ],
       };
