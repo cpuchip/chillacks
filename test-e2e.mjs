@@ -119,7 +119,7 @@ const tools = (await alice.listTools()).tools.map((t) => t.name).sort();
 check(
   "tools exposed",
   tools.join(",") ===
-    "chillacks_ack,chillacks_channels,chillacks_claim,chillacks_roster,chillacks_selftest,chillacks_send",
+    "chillacks_ack,chillacks_channels,chillacks_claim,chillacks_recent,chillacks_roster,chillacks_selftest,chillacks_send",
   tools.join(","),
 );
 
