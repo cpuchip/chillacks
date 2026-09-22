@@ -498,7 +498,11 @@ const server = http.createServer(async (req, res) => {
     // The ping is also the death detector. A peer that vanished without a FIN
     // (killed process, slept box, dropped NAT mapping) never acks it, the
     // kernel gives up after its retransmit limit, and `close` fires here.
-    // Keepalive covers the quiet gaps; nothing waits on the shim to answer.
+    // Measured 2026-09-22 (network disconnect under an established socket,
+    // Linux tcp_retries2=15): 963 s from vanish to drop; delivery to the
+    // seat's live stream stayed immediate throughout. TCP keepalive is a belt
+    // for a socket the ping is not writing to: while the ping runs the socket
+    // is never idle, so keepalive does not arm and the retransmit limit rules.
     req.socket.setKeepAlive(true, 30_000);
     const ping = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 25_000);
     req.on("close", () => {

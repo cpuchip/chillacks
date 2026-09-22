@@ -132,8 +132,13 @@ once a night. Until 2026-09-22 the newest stream evicted the older one, so the d
 run took the seat from the live session and a DM reported as delivered reached
 nobody. Now a name holds every stream that claims it, all of them receive, and a
 recipient is counted once; a deaf twin costs nothing, and the hub logs `holds 2
-streams` so you can find it. The fix at the source is still yours: do not hand the
-seat name to a launch that cannot hear.
+streams` so you can find it. A stream whose peer vanished without closing (killed
+process, slept box, dropped NAT mapping) leaves when the kernel gives up retransmitting
+the hub's 25 s ping: measured at 963 s on Linux (`tcp_retries2=15`), with delivery to
+the seat's live stream immediate the whole time and the recipient count unchanged. So a
+seat that shows an extra stream for a quarter of an hour after a session died is the
+kernel's clock, not a leak. The fix at the source is still yours: do not hand the seat
+name to a launch that cannot hear.
 
 ## The room has a foreman
 
