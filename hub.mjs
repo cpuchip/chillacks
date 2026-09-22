@@ -33,6 +33,12 @@ const ARCHIVE_DIR =
   process.env.CHILLACKS_ARCHIVE || path.join(os.homedir(), ".stewards", "chillacks");
 const ARCHIVE = path.join(ARCHIVE_DIR, "room.jsonl");
 
+// Every log line carries a UTC stamp. Without one an eviction storm cannot be
+// dated after the fact: one log held 118 reconnect lines and no way to say
+// which nights they belonged to (2026-09-22).
+const stderr = console.error.bind(console);
+console.error = (...a) => stderr(new Date().toISOString(), ...a);
+
 const LOOPBACK = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhost";
 
 // Refuse to go wide open. Binding the mesh IP without a token would put an
@@ -45,11 +51,40 @@ if (!LOOPBACK && !TOKEN) {
   process.exit(2);
 }
 
-/** name -> { write(msg), end(), joined, authed, kind: 'sse'|'ws' } */
+/** name -> Set of { write(msg), end(), joined, authed, kind: 'sse'|'ws' }.
+ *  One name may hold several streams (2026-09-22). A newer stream used to
+ *  EVICT the older one, and a session that could not hear (a scheduled run
+ *  that inherited the seat name from its environment) took the seat from the
+ *  one that could: a DM counted as delivered reached nobody. Now every stream
+ *  a name holds receives, a recipient is counted once, and a stream leaves
+ *  only when its socket does. */
 const members = new Map();
 const history = [];
 const HISTORY_MAX = 200;
 let seq = 0;
+/** every name that has ever sent (archive included); see knownNames() */
+const seen = new Set();
+
+function addStream(name, m) {
+  let set = members.get(name);
+  if (!set) members.set(name, (set = new Set()));
+  set.add(m);
+  const tag = m.kind === "ws" ? " (ws)" : "";
+  console.error(`[chillacks] + ${name}${tag}  (${members.size} present)`);
+  if (set.size > 1)
+    console.error(
+      `[chillacks] ! ${name} holds ${set.size} streams, all receive; if this persists, a second session is carrying this seat name`,
+    );
+}
+
+function dropStream(name, m) {
+  const set = members.get(name);
+  if (!set?.delete(m)) return; // already gone (end() and close both land here)
+  if (!set.size) members.delete(name);
+  const tag = m.kind === "ws" ? " (ws)" : "";
+  const rest = set.size ? `, ${set.size} stream(s) remain` : "";
+  console.error(`[chillacks] - ${name}${tag}  (${members.size} present${rest})`);
+}
 
 // --- channels: working groups, so a message wakes the seats it concerns -----
 // The night-orders retro measured the cost of broadcast-as-default: every
@@ -108,6 +143,37 @@ function mentionsIn(text) {
   return [...out];
 }
 
+/** Every name the hub could address: present, token-holding, in a channel, or
+ *  has ever sent. Absent-but-known reads as "archived, they catch up later";
+ *  unknown is a typo or a nickname nobody registered, and must say so. */
+function knownNames() {
+  const names = new Set([...members.keys(), ...tokenToName.values(), ...seen]);
+  for (const s of channels.values()) for (const n of s) names.add(n);
+  return names;
+}
+const isKnown = (name) => knownNames().has(name);
+
+function editDistance(a, b) {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++)
+    for (let j = 1; j <= b.length; j++)
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[a.length][b.length];
+}
+
+/** Up to three known names that contain, are contained by, or sit within two
+ *  edits of the target: a shortened seat name finds its long form. */
+function nearestNames(target) {
+  const t = String(target).toLowerCase();
+  const out = [];
+  for (const n of knownNames()) {
+    const l = n.toLowerCase();
+    if (l.includes(t) || t.includes(l) || editDistance(l, t) <= 2) out.push(n);
+  }
+  return out.slice(0, 3);
+}
+
 // --- archive: append-only, never rewritten -------------------------------
 fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 
@@ -119,6 +185,7 @@ function loadArchive() {
     try {
       const m = JSON.parse(line);
       history.push(m);
+      if (m.from) seen.add(String(m.from));
       if (m.id > seq) seq = m.id;
     } catch {
       bad++; // a torn final write survives as one skipped line, not a dead hub
@@ -224,12 +291,13 @@ try {
  *  retries with backoff, so they come back properly identified within seconds. */
 function dropUnauthenticated() {
   let n = 0;
-  for (const [name, m] of [...members]) {
-    if (m.authed) continue;
-    m.end();
-    members.delete(name);
-    n++;
-  }
+  for (const [name, set] of [...members])
+    for (const m of [...set]) {
+      if (m.authed) continue;
+      m.end();
+      dropStream(name, m);
+      n++;
+    }
   if (n) console.error(`[chillacks] dropped ${n} pre-identity stream(s) — they will reconnect with tokens`);
 }
 
@@ -273,9 +341,9 @@ function deliver(msg, { echo = false } = {}) {
   let n = 0;
   for (const name of targets) {
     if (name === msg.from && !echo) continue; // normally don't echo to sender
-    const m = members.get(name);
-    if (!m) continue; // the room archives but does not queue — absent means missed
-    m.write(msg);
+    const set = members.get(name);
+    if (!set?.size) continue; // the room archives but does not queue — absent means missed
+    for (const m of set) m.write(msg); // every stream the name holds, one recipient
     n++;
   }
   return n; // actual deliveries, not a guess from roster size
@@ -410,15 +478,6 @@ const server = http.createServer(async (req, res) => {
       return json(403, { error: `token is for "${who}", not "${claimed}"` });
     const name = AUTH ? who : claimed;
 
-    // A reconnect replaces the old stream rather than doubling delivery. With
-    // self-asserted names that also means anyone can EVICT anyone by claiming
-    // their name — so make it loud rather than silent until identity is real.
-    const prior = members.get(name);
-    if (prior) {
-      console.error(`[chillacks] ! ${name} reconnected — evicting the previous stream`);
-      prior.end();
-    }
-
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
@@ -427,23 +486,24 @@ const server = http.createServer(async (req, res) => {
     res.write(": connected\n\n");
     // Remember whether this stream proved who it was, so enabling identity
     // later can tell the pre-identity connections apart and close them.
-    members.set(name, {
-      write: (msg) => res.write(`data: ${JSON.stringify(msg)}\n\n`),
+    const m = {
+      write: (msg) => { try { res.write(`data: ${JSON.stringify(msg)}\n\n`); } catch {} },
       end: () => res.end(),
-      res,
       joined: Date.now(),
       authed: Boolean(who),
       kind: "sse",
-    });
-    console.error(`[chillacks] + ${name}  (${members.size} present)`);
+    };
+    addStream(name, m);
 
-    const ping = setInterval(() => res.write(": ping\n\n"), 25_000);
+    // The ping is also the death detector. A peer that vanished without a FIN
+    // (killed process, slept box, dropped NAT mapping) never acks it, the
+    // kernel gives up after its retransmit limit, and `close` fires here.
+    // Keepalive covers the quiet gaps; nothing waits on the shim to answer.
+    req.socket.setKeepAlive(true, 30_000);
+    const ping = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 25_000);
     req.on("close", () => {
       clearInterval(ping);
-      if (members.get(name)?.res === res) {
-        members.delete(name);
-        console.error(`[chillacks] - ${name}  (${members.size} present)`);
-      }
+      dropStream(name, m);
     });
     return;
   }
@@ -479,13 +539,23 @@ const server = http.createServer(async (req, res) => {
     // session that is in .mcp.json but NOT named in the launch flag has working
     // tools and a dead ear, and this is the only way to tell from inside.
     archive(msg);
+    seen.add(msg.from);
     history.push(msg);
     if (history.length > HISTORY_MAX) history.shift();
     const n = deliver(msg, { echo: p.echo === true });
+    // A DM to a name the hub has never met is archived like any other, but the
+    // sender must not read its "0 recipients" as "archived, they catch up":
+    // six corrections once went to a shortened seat name that way (2026-09-18).
+    const unknown = Boolean(msg.to) && n === 0 && !isKnown(msg.to);
     console.error(
-      `[chillacks] ${msg.from} -> ${msg.to || (msg.channel ? "#" + msg.channel : "#all")} [${n}]: ${msg.text.slice(0, 80)}`,
+      `[chillacks] ${msg.from} -> ${msg.to || (msg.channel ? "#" + msg.channel : "#all")} [${n}]${unknown ? " UNKNOWN SEAT" : ""}: ${msg.text.slice(0, 80)}`,
     );
-    return json(200, { ok: true, id: msg.id, delivered_to: n });
+    return json(200, {
+      ok: true,
+      id: msg.id,
+      delivered_to: n,
+      ...(unknown ? { unknown: true, suggest: nearestNames(msg.to) } : {}),
+    });
   }
 
   // --- POST /channel : {action: join|leave, channel} ------------------------
@@ -675,30 +745,23 @@ server.on("upgrade", (req, socket) => {
   );
   socket.setNoDelay(true);
 
-  const prior = members.get(name);
-  if (prior) {
-    console.error(`[chillacks] ! ${name} reconnected (ws) — evicting the previous stream`);
-    prior.end();
-  }
   const end = () => { try { socket.write(WS_CLOSE); } catch {} socket.destroy(); };
-  members.set(name, {
+  const m = {
     write: (msg) => { try { socket.write(wsTextFrame(JSON.stringify(msg))); } catch {} },
     end,
     joined: Date.now(),
     authed: AUTH ? true : false,
     kind: "ws",
-  });
-  console.error(`[chillacks] + ${name} (ws)  (${members.size} present)`);
+  };
+  addStream(name, m);
+  socket.setKeepAlive(true, 30_000);
 
   const ping = setInterval(() => { try { socket.write(WS_PING); } catch {} }, 25_000);
   const state = { buf: Buffer.alloc(0) };
   socket.on("data", (chunk) => { if (wsConsume(state, chunk, socket)) end(); });
   const bye = () => {
     clearInterval(ping);
-    if (members.get(name)?.kind === "ws" && members.get(name)?.end === end) {
-      members.delete(name);
-      console.error(`[chillacks] - ${name} (ws)  (${members.size} present)`);
-    }
+    dropStream(name, m);
   };
   socket.on("close", bye);
   socket.on("error", bye);

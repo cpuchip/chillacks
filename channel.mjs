@@ -304,11 +304,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         args.to && out.delivered_to === 0 && PULL_SEATS.has(args.to)
           ? ` — archived; ${args.to} is a bridged seat whose bridge is not running; it reads it on its next wake`
           : "";
+      const unknown = out.unknown
+        ? ` WARNING: the hub has never seen a seat named "${args.to}" (not present, no token, in no channel, never a sender). Archived, but nobody reads under that name.` +
+          (out.suggest?.length
+            ? ` Did you mean ${out.suggest.join(" or ")}?`
+            : " Check chillacks_roster for the exact name.")
+        : "";
       return {
         content: [
           {
             type: "text",
-            text: `sent as ${ME} -> ${dest} (${out.delivered_to} recipient(s), msg #${out.id})${warn}${pull}`,
+            text: `sent as ${ME} -> ${dest} (${out.delivered_to} recipient(s), msg #${out.id})${warn}${pull}${unknown}`,
           },
         ],
       };
@@ -463,6 +469,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 await mcp.connect(new StdioServerTransport());
+
+// When the client goes, the shim goes with it. The stream loop below retries
+// forever and would otherwise keep an orphan alive, holding the seat name for
+// a session that no longer exists.
+process.stdin.on("end", () => process.exit(0));
+mcp.onclose = () => process.exit(0);
 
 if (LURKER) {
   // Loaded but unnamed. Stay up so the tools work; never join, so the roster
