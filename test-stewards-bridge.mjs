@@ -260,6 +260,21 @@ try {
   check("restart after the clears sends no second DM", dmsMatching(/third-ruling/).length === 1,
     `${dmsMatching(/third-ruling/).length} DM(s)`);
 
+  // T7: a stall. An unfinished item that never moves wakes the driver once, and only once.
+  bridge.kill();
+  await bridge.exited;
+  bridge = runBridge({ STALL_MINUTES: "0.05" }); // 3 s
+  await until(() => /holds its stream/.test(bridge.log));
+  putItem({ id: "item-stuck", slug: "stuck-one", status: "in_progress", pipeline_family: "p", current_stage: "build" });
+  await until(() => dmsMatching(/stalled: stuck-one/).length > 0, 12000);
+  check("an item unchanged past STALL_MINUTES wakes the driver as stalled", dmsMatching(/stalled: stuck-one/).length === 1);
+  await settle(4000);
+  check("a stall wakes once per stuck state, not every poll", dmsMatching(/stalled: stuck-one/).length === 1,
+    `${dmsMatching(/stalled: stuck-one/).length} DM(s)`);
+  putItem({ id: "item-stuck", status: "completed" });
+  await settle(1500);
+  check("finishing the stuck item sends no further stall", dmsMatching(/stalled: stuck-one/).length === 1);
+
   // T6: the ruling wall. The bridge only ever called reads and notes.
   const allowed = new Set(["work_item_list", "work_item_show", "a2a_note", "a2a_note_clear", "substrate_tool:a2a_inbox"]);
   const strays = [...new Set(calls)].filter((c) => !allowed.has(c));

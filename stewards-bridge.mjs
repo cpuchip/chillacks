@@ -14,6 +14,8 @@
  *               escalation  escalation_state -> queued after failed attempts
  *               failed      status failed and past the steward's retries
  *               done        status -> completed
+ *               stalled     pending or in_progress, unchanged for STALL_MINUTES
+ *                           (off unless set), once per stuck state
  *   INBOUND   it holds the room stream as the instance's own seat; each DM to it
  *             becomes an a2a_note to the instance's collective inbox, prefixed
  *             so it reads as input and not as a directive, and wakes the driver
@@ -49,6 +51,7 @@
  *   INBOUND_PREFIX      text before inbound input (default below)
  *   WAKE_STATE          state cache (default: <archive>/state/stewards-bridge-<seat>.json)
  *   POLL_SECONDS        default 30
+ *   STALL_MINUTES       wake on an unfinished item unchanged this long (default 0 = off)
  *   STEWARDS_BRIDGE_FAULT=after-dm | after-sent | after-clear   test only: exit
  *                       between a wake's DM and its `sent` row (the next start
  *                       re-sends once), or after the `sent` row, or after the
@@ -301,6 +304,8 @@ function describe(event, w) {
 // watcher keyed on updated_at misses real escalations. Every item that is not
 // finished is re-read each poll; finished items are re-read only if they moved.
 const FINISHED = new Set(["completed", "cancelled"]);
+const MOVING = new Set(["pending", "in_progress"]);
+const STALL_MS = Math.max(0, Number(process.env.STALL_MINUTES || 0)) * 60000; // 0 = off
 function signature(w) {
   return [w.status, w.escalation_state, w.escalation_attempts, w.failure_count,
     w.a2a_question ? String(w.a2a_question).length : 0, w.updated_at].join("|");
@@ -316,7 +321,20 @@ async function poll() {
       const w = await tool("work_item_show", { id_or_slug: it.id });
       if (!w || typeof w !== "object") continue;
       const sig = signature(w);
-      if (sig === prev) continue;
+      if (sig === prev) {
+        // A stall: an unfinished item whose state has not moved for STALL_MINUTES. It
+        // never completes and never parks, so nothing else would wake the driver.
+        const since = Date.parse((state.since || {})[it.id] || "");
+        if (STALL_MS && MOVING.has(w.status) && since && Date.now() - since > STALL_MS) {
+          const mins = Math.round((Date.now() - since) / 60000);
+          await wake(`${w.id}:stalled:${sig}`, "stalled",
+            `[${SEAT} wake] stalled: ${w.slug || String(w.id).slice(0, 8)} (${String(w.id).slice(0, 8)}) ` +
+            `${w.pipeline_family}/${w.current_stage} has been ${w.status} with no change for ${mins} min. Look at it.`, w.id);
+        }
+        continue;
+      }
+      state.since = state.since || {};
+      state.since[it.id] = new Date().toISOString();
       const event = classify(w);
       // A first poll (no state) wakes only OPEN ASKS, which wait on the driver no
       // matter when they arrived; news (done, failed) from before is recorded quietly.
