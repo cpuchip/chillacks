@@ -7,8 +7,9 @@
   "type": "module",
   "scripts": {
     "hub": "node hub.mjs",
-    "test": "node test-e2e.mjs && node test-identity.mjs && node test-hotload.mjs && node test-v02.mjs && node test-streams.mjs",
+    "test": "node test-e2e.mjs && node test-identity.mjs && node test-hotload.mjs && node test-v02.mjs && node test-streams.mjs && node test-stewards-bridge.mjs",
     "test:e2e": "node test-e2e.mjs",
+    "test:stewards-bridge": "node test-stewards-bridge.mjs",
     "test:identity": "node test-identity.mjs",
     "check-archive": "node check-archive.mjs",
     "tokens": "node tokens.mjs"

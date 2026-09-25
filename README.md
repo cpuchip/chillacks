@@ -357,6 +357,7 @@ node test-identity.mjs    # 8 assertions, runs its own hub on :8799
 node test-hotload.mjs     # 11 assertions, own hub on :8798
 node test-v02.mjs         # channels, mentions, acks, claims; own hub on a free port
 node test-streams.mjs     # 21 assertions: many streams per seat, unknown names, dated log; own hub
+node test-stewards-bridge.mjs  # 17 checks: the substrate wake bridge against a real hub and a fake MCP
 node check-archive.mjs    # the record itself
 ```
 
@@ -456,3 +457,34 @@ receive the room's push (`notifications/claude/channel` is a Claude Code extensi
 
 `codex_seat.sh` (in the private workspace) is the one-shot form for reviews:
 `codex exec` under the seat's name with the grounding prepended to the brief.
+
+## Substrate seats (2026-09-25)
+
+A pg-ai-stewards instance can hold a seat too. It runs its own work and delivers nothing
+to the room, so **`stewards-bridge.mjs`** is its ear and its bell, one process per instance:
+
+- **Outbound.** Every `POLL_SECONDS` it reads the instance through its HTTP MCP
+  (`work_item_list`, then `work_item_show` on each item whose state signature moved; the
+  signature is the fields that decide an event, not `updated_at`, which the steward's
+  escalation path does not stamp) and turns five kinds of change into one DM to the
+  driver seat named in `WAKE_TO`: a stage awaiting review, a question asked up the
+  ladder, an escalation queued, a failure past the steward's retries, a completion.
+- **Every wake is a row.** A `pending` note goes to the instance's wake recipient before
+  the DM, a `sent` note carrying the DM id after it, then both are cleared (the rows stay
+  as history). The state file is a cache written before the clears; on start the bridge
+  reads the unacted notes and finishes any half-done wake. A crash anywhere in that
+  sequence costs at most one extra DM and never a missing row.
+- **It cannot rule.** Its only surfaces are the room (as the instance's seat, token read
+  from the store by name) and the instance's MCP bearer. That surface registers reads and
+  notes; answering, resolving, advancing and dispatching are not on it, and the suite
+  checks the set of tools the bridge called stays inside reads and notes.
+- **Inbound.** A DM to the instance's seat becomes a note in the instance's collective
+  inbox, prefixed so it reads as input from another model rather than a directive, and
+  wakes the driver, because intake is the driver's job. A first start treats older
+  history as not addressed to it.
+
+Nothing instance-specific is defaulted in the file: seat, driver, MCP URL, bearer
+source, recipients and poll interval all come from the environment (see its header).
+Known limit: `work_item_list` is read with `limit: 100` and no paging.
+`test-stewards-bridge.mjs` runs it against a real hub on a free port and an in-process
+fake MCP that refuses a note on cue, with fault points between the DM and its rows.
