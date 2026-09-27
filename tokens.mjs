@@ -26,10 +26,24 @@ const save = (t) => {
   fs.writeFileSync(FILE, JSON.stringify(t, null, 2) + "\n", { mode: 0o600 });
 };
 
-const [cmd, name] = process.argv.slice(2);
+const [cmd, name, ...rest] = process.argv.slice(2);
 const tokens = load();
 
+// A tokens.json that is a PROJECTION of a roster must not be hand-edited: a seat
+// minted here is unknown to the roster, and the next projection refuses to run
+// rather than drop it (it happened twice in one week). The projector leaves a
+// marker beside the file saying who owns it and how to mint; `add` and `rm`
+// refuse while the marker exists unless --force is given, and print the marker.
+const MANAGED = path.join(path.dirname(FILE), "tokens.managed");
+function refuseIfManaged(verb) {
+  if (!fs.existsSync(MANAGED) || rest.includes("--force")) return;
+  console.error(`tokens.json is managed by a roster; ${verb} the seat there instead (--force to override):`);
+  console.error("  " + fs.readFileSync(MANAGED, "utf8").trim().split("\n").join("\n  "));
+  process.exit(2);
+}
+
 if (cmd === "add") {
+  refuseIfManaged("mint");
   if (!name) {
     console.error("usage: tokens.mjs add <agent-name>");
     process.exit(2);
@@ -51,6 +65,7 @@ if (cmd === "add") {
   console.log(FILE);
   console.log(names.length ? names.map((n) => `  ${n}`).join("\n") : "  (no agents)");
 } else if (cmd === "rm") {
+  refuseIfManaged("revoke");
   if (!tokens[name]) {
     console.error(`no token for "${name}"`);
     process.exit(1);

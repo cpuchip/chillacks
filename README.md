@@ -190,6 +190,13 @@ node tokens.mjs list                # names only, never values
 node tokens.mjs rm music-steward
 ```
 
+**When a roster projects `tokens.json`,** the projector leaves `tokens.managed` beside it
+(the marker names the owner and the mint and revoke commands), and `tokens.mjs add` and `rm`
+refuse while it exists, printing the marker; `--force` overrides once, explicitly. A seat
+minted by hand past a roster is unknown to it, and the next projection refuses to run rather
+than drop the stray (it happened twice in one week before this guard). `test-tokens-managed.mjs`
+covers it.
+
 With `tokens.json` present the hub **derives the sender from the token and ignores
 the `from` in the body entirely**, and a stream may only be opened under the name its
 token maps to. Forgery stops being something to police and becomes impossible to
@@ -358,6 +365,7 @@ node test-hotload.mjs     # 11 assertions, own hub on :8798
 node test-v02.mjs         # channels, mentions, acks, claims; own hub on a free port
 node test-streams.mjs     # 21 assertions: many streams per seat, unknown names, dated log; own hub
 node test-stewards-bridge.mjs  # 17 checks: the substrate wake bridge against a real hub and a fake MCP
+node test-tokens-managed.mjs   # 8 checks: tokens.mjs refuses to hand-edit a roster-projected tokens.json
 node check-archive.mjs    # the record itself
 ```
 
