@@ -32,6 +32,16 @@ param(
   # Mint a token first if this agent doesn't have one yet.
   [switch]$Mint,
 
+  # Hand the new seat its name and its job on its first prompt: the session opens with a
+  # generated first message (who it is, which box, where its charter row is, your brief,
+  # and the one DM it owes the foreman). Defaults ON with -Mint; -NoBrief turns it off.
+  [string]$Brief,
+  [switch]$NoBrief,
+
+  # A charter file (markdown) written into the seat's roster row at mint time, so the
+  # seat reads its own charter from the record on first drop-in. Needs -Mint.
+  [string]$Charter,
+
   # Open in its own window instead of taking over this one.
   [switch]$NewWindow,
 
@@ -165,7 +175,10 @@ if (Test-Path $TokensFile) {
 }
 
 if (-not $token) {
-  if ($Mint) {
+  if ($Mint -and $DryRun) {
+    Write-Host "dry run: would mint '$Agent'$(if ($Charter) { " with charter $Charter" }) and launch; nothing minted." -ForegroundColor Yellow
+    $token = 'dry-run'
+  } elseif ($Mint) {
     Write-Host "minting a token for '$Agent'" -ForegroundColor Cyan
     $managed = Join-Path (Split-Path $TokensFile -Parent) 'tokens.managed'
     if (Test-Path $managed) {
@@ -182,7 +195,12 @@ if (-not $token) {
       }
       $box = $env:CHILLACKS_BOX; if (-not $box) { $box = $env:COMPUTERNAME.ToLower() }
       $note = "minted by launch.ps1 -Mint on $box, $(Get-Date -Format 'yyyy-MM-dd')"
-      python $roster add-seat $Agent --box $box --notes $note 2>&1 | ForEach-Object { Write-Host "  $_" }
+      $mintArgs = @('add-seat', $Agent, '--box', $box, '--notes', $note)
+      if ($Charter) {
+        if (-not (Test-Path $Charter)) { Write-Host "charter file not found: $Charter" -ForegroundColor Red; exit 1 }
+        $mintArgs += @('--charter-file', (Resolve-Path $Charter).Path)
+      }
+      python $roster @mintArgs 2>&1 | ForEach-Object { Write-Host "  $_" }
       if ($LASTEXITCODE -ne 0) {
         Write-Host "  add-seat did not insert (an active row named '$Agent' may already exist); rendering the roster instead" -ForegroundColor Yellow
         python $roster render 2>&1 | ForEach-Object { Write-Host "  $_" }
@@ -246,12 +264,37 @@ elseif ($Resume) { $claudeArgs += '--resume';               $resumeNote = 'resum
 elseif ($Continue){ $claudeArgs += '--continue';            $resumeNote = "resuming the most recent conversation from $WorkDir" }
 if ($Fork) { $claudeArgs += '--fork-session'; $resumeNote += ', forked into a new session id' }
 
+# --- the first prompt: the seat learns who it is before it does anything ------------------
+# Claude Code takes an initial prompt as a positional argument in interactive mode. With -Mint
+# (unless -NoBrief) or with -Brief, the session opens already knowing its name, its box, where
+# its charter row lives, and the one DM it owes the foreman. Nothing here is secret: the token
+# travels in the environment, never in this text.
+$firstPrompt = $null
+if (($Mint -and -not $NoBrief) -or $Brief) {
+  $box = $env:CHILLACKS_BOX; if (-not $box) { $box = $env:COMPUTERNAME.ToLower() }
+  $lines = @(
+    "You are the seat '$Agent' on box $box, $(if ($Mint) { 'minted today' } else { 'launched' }) $(Get-Date -Format 'yyyy-MM-dd') by Michael through launch.ps1.",
+    "Your identity in chillacks is already '$Agent' (the channel derives it from your token; never paste a token anywhere).",
+    "Your charter, if one was written, is the 'charter' column of your house.roster row in the record; read it before anything else:",
+    "  docker exec -i stewards-oss-pg psql -U stewards -d stewards -X -At -c `"select coalesce(charter, notes, '(no charter yet)') from house.roster where name='$Agent'`"",
+    "If it says no charter yet, work only from the brief below and ask workspace-basecamp for a charter.",
+    "Then read the house instructions this folder loads (CLAUDE.md and what it imports, .mind/standing-orders.md), and the memory index at private-workspace/memory/MEMORY.md."
+  )
+  if ($Brief) { $lines += "Michael's brief for you, verbatim: $Brief" }
+  $lines += "Your first act in the room: one DM to workspace-basecamp with your name, your brief in your own words, and your first step. Nothing outward (no push, no post, no message to anyone else) until your charter has been read."
+  $firstPrompt = ($lines -join "`n")
+}
+
 Write-Host ''
 Write-Host "agent    $Agent"        -ForegroundColor Cyan
 Write-Host "cwd      $WorkDir"
 Write-Host "identity $(if ($token) { 'token loaded from tokens.json' } else { 'NONE — self-asserted' })"
 Write-Host "session  $resumeNote"
-Write-Host "command  claude $($claudeArgs -join ' ')"
+Write-Host "command  claude $($claudeArgs -join ' ')$(if ($firstPrompt) { ' "<first prompt>"' })"
+if ($firstPrompt) {
+  Write-Host 'first prompt:' -ForegroundColor Cyan
+  $firstPrompt -split "`n" | ForEach-Object { Write-Host "  $_" }
+}
 Write-Host ''
 if ($Continue) {
   Write-Host '-Continue is scoped to the working directory above, not to wherever you' -ForegroundColor Yellow
@@ -278,13 +321,14 @@ if ($NewWindow) {
   # The child needs the env, so set it inside the new shell rather than relying
   # on inheritance from a Start-Process that has already returned.
   $tokenLine = if ($token) { "`$env:CHILLACKS_TOKEN='$token'; " } else { '' }
+  $promptArg = if ($firstPrompt) { " '" + ($firstPrompt -replace "'", "''") + "'" } else { '' }
   $cmd = "`$env:CHILLACKS_AGENT='$Agent'; $tokenLine" +
-         "Set-Location '$WorkDir'; claude $($claudeArgs -join ' ')"
+         "Set-Location '$WorkDir'; claude $($claudeArgs -join ' ')$promptArg"
   Start-Process pwsh -ArgumentList '-NoExit', '-Command', $cmd
   Write-Host "launched '$Agent' in a new window" -ForegroundColor Green
 } else {
   $env:CHILLACKS_AGENT = $Agent
   if ($token) { $env:CHILLACKS_TOKEN = $token }
   Set-Location $WorkDir
-  & claude @claudeArgs
+  if ($firstPrompt) { & claude @claudeArgs $firstPrompt } else { & claude @claudeArgs }
 }
