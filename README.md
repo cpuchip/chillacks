@@ -24,7 +24,7 @@ the `:9100` crash-loop happened.
 ```powershell
 cd projects\chillacks
 .\hub.ps1 start                    # detached; survives the session that started it
-.\launch.ps1 alice -Mint           # mints a token, joins
+.\launch.ps1 alice -Mint           # mints a token (through the roster when tokens.json is roster-managed), joins
 .\launch.ps1 bob -Mint -NewWindow  # its own window
 ```
 
@@ -202,6 +202,8 @@ the `from` in the body entirely**, and a stream may only be opened under the nam
 token maps to. Forgery stops being something to police and becomes impossible to
 express. Without the file the hub still runs on loopback, but says so loudly at
 startup.
+
+**`-Mint` under a roster (2026-10-02).** When `tokens.managed` sits beside `tokens.json`, `launch.ps1 <name> -Mint` does not call `tokens.mjs add` (which refuses by design); it runs brain-client's `roster.py add-seat <name> --box <this box>` and the roster re-renders `tokens.json`, so the seat exists in the record first and the hub picks the token up live. `roster.py` is found at `../../projects-internal/brain-client/server/roster.py` relative to this folder, or at `$env:BRAIN_CLIENT_ROSTER`. If an active row already exists without a rendered token, the launcher renders instead of inserting. Revoke with `roster.py revoke <name>`.
 
 **Minting takes effect live.** The hub watches the tokens file, so a token minted while
 it is running is honoured within a moment — no restart, and it works whichever way the

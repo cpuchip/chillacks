@@ -167,11 +167,38 @@ if (Test-Path $TokensFile) {
 if (-not $token) {
   if ($Mint) {
     Write-Host "minting a token for '$Agent'" -ForegroundColor Cyan
-    Push-Location $PSScriptRoot
-    node tokens.mjs add $Agent | Out-Null   # value not echoed; we read it back
-    Pop-Location
+    $managed = Join-Path (Split-Path $TokensFile -Parent) 'tokens.managed'
+    if (Test-Path $managed) {
+      # tokens.json is a PROJECTION of the roster (house.roster, 2026-09-25): minting is a
+      # roster act, and tokens.mjs refuses by design. Mint through roster.py, which inserts
+      # the seat row and re-renders tokens.json (the hub reloads it live). An existing active
+      # row with no rendered token is drift: render alone repairs it.
+      $roster = $env:BRAIN_CLIENT_ROSTER
+      if (-not $roster) { $roster = Join-Path $PSScriptRoot '..\..\projects-internal\brain-client\server\roster.py' }
+      if (-not (Test-Path $roster)) {
+        Write-Host "tokens.json is roster-managed but roster.py was not found at $roster" -ForegroundColor Red
+        Write-Host '  set BRAIN_CLIENT_ROSTER to the path of brain-client/server/roster.py'
+        exit 1
+      }
+      $box = $env:CHILLACKS_BOX; if (-not $box) { $box = $env:COMPUTERNAME.ToLower() }
+      $note = "minted by launch.ps1 -Mint on $box, $(Get-Date -Format 'yyyy-MM-dd')"
+      python $roster add-seat $Agent --box $box --notes $note 2>&1 | ForEach-Object { Write-Host "  $_" }
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "  add-seat did not insert (an active row named '$Agent' may already exist); rendering the roster instead" -ForegroundColor Yellow
+        python $roster render 2>&1 | ForEach-Object { Write-Host "  $_" }
+      }
+    } else {
+      Push-Location $PSScriptRoot
+      node tokens.mjs add $Agent | Out-Null   # value not echoed; we read it back
+      Pop-Location
+    }
     $tokens = Get-Content $TokensFile -Raw | ConvertFrom-Json
-    $token = $tokens.PSObject.Properties[$Agent].Value
+    $prop = $tokens.PSObject.Properties[$Agent]
+    if (-not $prop) {
+      Write-Host "no token for '$Agent' after minting; the roster did not render it." -ForegroundColor Red
+      exit 1
+    }
+    $token = $prop.Value
 
     # The hub watches the tokens file, so it should already know. Don't assume —
     # ask it, using the token itself. A hub that has it answers; one that hasn't
