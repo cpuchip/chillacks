@@ -321,16 +321,25 @@ Write-Host 'Accept the dev-channels warning and the MCP consent prompt when they
 Write-Host 'Then ask the session "is the channel working?" to verify with chillacks_selftest.'
 Write-Host ''
 
+# A seat launched from inside another Claude Code session inherits that session's
+# process environment: CLAUDE_CODE_CHILD_SESSION (transcript saving off, no resume; two
+# seats ran that way on 2026-10-03), its session id, its messaging socket, its effort,
+# and more. A seat is a peer, not a child, so every CLAUDE* variable is scrubbed before
+# claude starts. None are set at user or machine level on the house boxes, so nothing
+# deliberate is lost; a persistent setting belongs in ~/.claude/settings.json instead.
+$scrub = 'Get-ChildItem Env: | Where-Object Name -match ''^CLAUDE'' | ForEach-Object { Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue }; '
+
 if ($NewWindow) {
   # The child needs the env, so set it inside the new shell rather than relying
   # on inheritance from a Start-Process that has already returned.
   $tokenLine = if ($token) { "`$env:CHILLACKS_TOKEN='$token'; " } else { '' }
   $promptArg = if ($firstPrompt) { " '" + ($firstPrompt -replace "'", "''") + "'" } else { '' }
-  $cmd = "`$env:CHILLACKS_AGENT='$Agent'; $tokenLine" +
+  $cmd = "$scrub`$env:CHILLACKS_AGENT='$Agent'; $tokenLine" +
          "Set-Location '$WorkDir'; claude $($claudeArgs -join ' ')$promptArg"
   Start-Process pwsh -ArgumentList '-NoExit', '-Command', $cmd
   Write-Host "launched '$Agent' in a new window" -ForegroundColor Green
 } else {
+  Invoke-Expression $scrub
   $env:CHILLACKS_AGENT = $Agent
   if ($token) { $env:CHILLACKS_TOKEN = $token }
   Set-Location $WorkDir
