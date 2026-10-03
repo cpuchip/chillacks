@@ -42,6 +42,9 @@ param(
   # seat reads its own charter from the record on first drop-in. Needs -Mint.
   [string]$Charter,
 
+  # Effort for this session (passed through as claude --effort): low, medium, high, xhigh, max.
+  [string]$Effort,
+
   # Open in its own window instead of taking over this one.
   [switch]$NewWindow,
 
@@ -257,6 +260,7 @@ if (-not $token) {
 # --- launch ---------------------------------------------------------------
 $claudeArgs = @('--dangerously-load-development-channels', 'server:chillacks')
 if (-not $Supervised) { $claudeArgs += '--dangerously-skip-permissions' }
+if ($Effort) { $claudeArgs += @('--effort', $Effort) }
 
 $resumeNote = 'starting a fresh conversation'
 if ($ResumeId)   { $claudeArgs += @('--resume', $ResumeId); $resumeNote = "resuming session $ResumeId" }
