@@ -260,6 +260,10 @@ if (-not $token) {
 # --- launch ---------------------------------------------------------------
 $claudeArgs = @('--dangerously-load-development-channels', 'server:chillacks')
 if (-not $Supervised) { $claudeArgs += '--dangerously-skip-permissions' }
+# Remote Control under the seat's name, from the start: a seat only appears in the Claude app's
+# session list when it is launched with the flag (toggling /rc inside a running session says
+# "available" but does not list it; measured 2026-10-07). Same as the Linux launchers.
+$claudeArgs += @('--remote-control', $Agent)
 if ($Effort) { $claudeArgs += @('--effort', $Effort) }
 
 $resumeNote = 'starting a fresh conversation'
