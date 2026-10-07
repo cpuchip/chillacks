@@ -264,6 +264,9 @@ if (-not $Supervised) { $claudeArgs += '--dangerously-skip-permissions' }
 # session list when it is launched with the flag (toggling /rc inside a running session says
 # "available" but does not list it; measured 2026-10-07). Same as the Linux launchers.
 $claudeArgs += @('--remote-control', $Agent)
+# The display name too (what /rename sets: the session picker, the terminal title, and the
+# name the Claude app shows), so a seat is found by its roster name without a hand renaming it.
+$claudeArgs += @('--name', $Agent)
 if ($Effort) { $claudeArgs += @('--effort', $Effort) }
 
 $resumeNote = 'starting a fresh conversation'
