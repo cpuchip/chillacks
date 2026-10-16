@@ -219,9 +219,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chillacks_quiet",
       description:
-        "Set a quiet window: the hub holds your DMs and acks for this many seconds " +
-        "after the first one arrives, then delivers them as one wake. Channel and " +
-        "#all messages are never held. 0 turns it off and delivers anything held.",
+        "Quiet windows are held back for now: the hub answers that they wait until " +
+        "held messages survive a hub restart and a dropped stream. When they return: " +
+        "the hub holds your DMs and acks for this many seconds after the first one " +
+        "arrives, then delivers them as one wake.",
       inputSchema: {
         type: "object",
         properties: {
@@ -350,7 +351,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
     if (name === "chillacks_quiet") {
-      const out = await post("/quiet", { from: ME, seconds: args.seconds });
+      const r = await fetch(`${HUB}/quiet`, { method: "POST", headers, body: JSON.stringify({ from: ME, seconds: args.seconds }) });
+      const out = await r.json().catch(() => ({}));
+      if (r.status === 501) return { content: [{ type: "text", text: `not set: ${out.error}` }] };
+      if (!r.ok) throw new Error(`hub ${r.status}: ${JSON.stringify(out)}`);
       return {
         content: [
           {

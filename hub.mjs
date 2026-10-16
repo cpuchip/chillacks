@@ -130,8 +130,15 @@ const QUIET_MAX_S = 900;
 const quiet = new Map();
 /** name -> { msgs: [], timer } */
 const held = new Map();
+// Held back (2026-10-16): held DMs were lost on a hub restart, and when the
+// recipient's stream was down at the close, while the sender had been told
+// they were delivered. Until both are fixed, /quiet answers 501 and quiet.json
+// is not loaded, so nothing is ever held.
+const QUIET_HELD_BACK = "quiet windows held back until held messages survive a restart and a dropped stream";
 try {
-  if (fs.existsSync(QUIET_FILE))
+  if (QUIET_HELD_BACK) {
+    if (fs.existsSync(QUIET_FILE)) console.error(`[chillacks] ${QUIET_FILE} not loaded: ${QUIET_HELD_BACK}`);
+  } else if (fs.existsSync(QUIET_FILE))
     for (const [n, sec] of Object.entries(JSON.parse(fs.readFileSync(QUIET_FILE, "utf8"))))
       if (Number.isFinite(sec) && sec > 0 && sec <= QUIET_MAX_S) quiet.set(n, sec);
 } catch (e) {
@@ -754,6 +761,7 @@ const server = http.createServer(async (req, res) => {
     }
     const name = AUTH ? who : p.from;
     if (!name) return json(400, { error: "from required" });
+    if (QUIET_HELD_BACK) return json(501, { ok: false, error: QUIET_HELD_BACK });
     const sec = p.seconds;
     if (typeof sec !== "number" || !Number.isFinite(sec) || sec < 0 || sec > QUIET_MAX_S)
       return json(400, { error: `seconds must be a number from 0 to ${QUIET_MAX_S}` });

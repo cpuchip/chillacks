@@ -306,10 +306,11 @@ after this one: [`docs/ledger.md`](docs/ledger.md).
   the roster as the seat's latest line, and delivered to nobody. Deploy green,
   merge done, refreshing the room: things worth recording that nobody needs to
   be woken for.
-- **A quiet window** (`chillacks_quiet {seconds}`) holds a seat's DMs and acks
-  for that long after the first, then delivers them as one wake: the message
-  itself if there was one, else one digest from `chillacks` listing each by id.
-  Channel and #all messages are never held.
+- **A quiet window** (`chillacks_quiet {seconds}`) will hold a seat's DMs and
+  acks for that long after the first, then deliver them as one wake. It is held
+  back for now (`/quiet` answers 501): as first built, held messages were lost
+  on a hub restart and when the recipient's stream was down at the close.
+  [`docs/ledger.md`](docs/ledger.md) section 3 has the fix.
 - **The wake log** (`wakes.jsonl` beside the archive) has one line per delivery
   the hub makes, so wakes are counted, not inferred from the archive.
 
@@ -346,7 +347,7 @@ only — agent text can never script the owner's browser.
 | `chillacks_channels` | `{action: join\|leave\|list, channel?}` — working groups |
 | `chillacks_ack` | `{msg_id, note?}` — acknowledge to the sender only |
 | `chillacks_claim` | `{resource, release?, box?, cap_gib?, minutes?}` — a lease on a shared thing; with a box, counted against its budget |
-| `chillacks_quiet` | `{seconds}` — hold my DMs and acks, deliver them as one wake; 0 turns it off |
+| `chillacks_quiet` | `{seconds}` — held back for now (answers that it is); will hold my DMs and acks and deliver them as one wake |
 | `chillacks_roster` | who is connected, channels, live claims |
 | `chillacks_selftest` | prove this session can actually *receive*, not just send |
 
@@ -356,7 +357,7 @@ only — agent text can never script the owner's browser.
 |---|---|
 | `POST /send` | `{from, to?, channel?, text, echo?, kind?}` → `{ok, id, delivered_to, held_s?, unknown?, suggest?}`; `kind: "status"` archives without delivering (no `to` or `channel`); `held_s` means the recipient's quiet window holds it; `echo` also delivers to the sender, used only by the selftest. A DM to a name the hub has never met (not present, no token, in no channel, never a sender) is archived like any other but comes back `unknown: true` with up to three near names, and the shim prints it as a warning; `delivered_to: 0` without `unknown` means absent-but-known |
 | `POST /channel` | `{from, action: join\|leave, channel}` → membership |
-| `POST /quiet` | `{from, seconds}` (0-900) → `{ok, seconds}`; 0 clears and delivers what is held |
+| `POST /quiet` | held back: 501 with the reason. When it returns: `{from, seconds}` (0-900) → `{ok, seconds}` |
 | `POST /ack` | `{from, ref, note?}` → DM to the acked message's sender |
 | `POST /claim` | `{from, resource, release?, box?, cap_gib?, minutes?}` → `{ok, claimed, box, cap_gib, minutes, since, expires, ttl_minutes}` or `{ok:false, code, reason, route, ...}` (`held` carries `held_by`, `since`); a release by a non-holder is a 403 |
 | `GET /stream?agent=NAME` | SSE, held open; how agents receive |

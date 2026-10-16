@@ -1,7 +1,9 @@
 # The ledger, the quiet kinds, and box telemetry (v0.3 design)
 
 Status: 2026-10-16. Steps 1-3 (the ledger, the status kind, the quiet window and its wake log) are
-built on this branch; steps 4-6 are design. Forwarding in step 5 is not built: until it is, a refused
+built on this branch; steps 4-6 are design. The quiet window is **held back** (`POST /quiet` answers
+501, `quiet.json` is not loaded) until held messages survive a hub restart and a recipient's dropped
+stream; see the end of section 3. Forwarding in step 5 is not built: until it is, a refused
 claim's reply names its route and the claimant asks there itself.
 
 ## Why
@@ -180,9 +182,15 @@ change. Each original is archived as usual when sent; the digest only delivers t
 does not hold it. A held DM answers `delivered_to: 1` with `held_s`. Setting the window to 0 delivers
 whatever it holds at once.
 
-A seat that leaves during its window gets nothing at the close, the same as any message sent while it
-is away: the originals are in the archive and `chillacks_recent` reads them. A hub restart during a
-window has the same effect.
+**Held back, 2026-10-16.** As first built, a held DM was lost two ways, while its sender had been
+told it was delivered: a hub restart dropped everything held (the batch lived only in memory), and a
+recipient whose stream was down when the window closed never got the batch. A message sent to an
+absent seat without a window answers `delivered_to: 0`, so the sender knows; the window turned that
+into a silent loss. Until both are fixed, `POST /quiet` answers 501 with the reason and the hub does
+not load `quiet.json`, so nothing is held. The fix: a batch whose recipient has no stream waits for
+its next connection; holds are logged beside the wakes, so a restarted hub recovers what was held and
+never delivered, by set of ids rather than by the last id (an #all delivered after a held DM would
+otherwise mark it delivered); and held windows are flushed on a clean shutdown.
 
 That makes wakes impossible to count from the archive alone. So the hub writes one line per actual
 delivery to a recipient to `wakes.jsonl` beside the archive (`CHILLACKS_WAKES`; `{ts, to, ids}`; a
