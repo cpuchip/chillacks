@@ -1,0 +1,168 @@
+/* claims.mjs — the claims ledger: leases on shared things, budgets per box.
+ *
+ * Pure: no clock, no disk, no network. The hub passes `now` in, writes the
+ * records this returns to the archive, and rebuilds the ledger from the
+ * archive on start, so a restart cannot forget a running 8 GiB job and grant
+ * past the budget. (Claims were ephemeral by design until 2026-10-16; that
+ * was right for a 15-minute lock on a test file and wrong for a budget.)
+ *
+ * Two kinds of claim share one table:
+ *   - the old shape, {resource}: an exclusive 15-minute lease, no box, no cap.
+ *     Every running shim sends this until it restarts, so it stays accepted.
+ *   - the budgeted shape, {resource, box, cap_gib, minutes}: also exclusive on
+ *     the resource, and the sum of live caps on the box stays at or under the
+ *     box's budget.
+ *
+ * A budget row is either {mem_gib, max_minutes, route} or {closed, route}: a
+ * closed box refuses every budgeted claim with its reason (a box whose monitor
+ * has not reported). `route` names who a refusal should reach; a refusal with
+ * no box to route by goes to the foreman the hub names.
+ */
+
+export const OLD_SHAPE_MINUTES = 15;
+export function newLedger(budgets, { foreman = null } = {}) {
+  return { budgets: budgets || {}, foreman, leases: new Map() };
+}
+
+const iso = (ms) => new Date(ms).toISOString();
+const live = (lease, now) => Date.parse(lease.expires) > now;
+
+/** Sum of live caps on a box, optionally leaving one resource out (a renewal
+ *  re-checks without counting itself twice). */
+function inUse(L, box, now, except = null) {
+  let gib = 0;
+  const holders = [];
+  for (const [r, l] of L.leases) {
+    if (l.box !== box || r === except || !live(l, now) || l.cap_gib == null) continue;
+    gib += l.cap_gib;
+    holders.push({ resource: r, by: l.by, cap_gib: l.cap_gib, expires: l.expires });
+  }
+  return { gib, holders };
+}
+
+const refuse = (code, reason, route, extra = {}) => ({ ok: false, code, reason, route, ...extra });
+
+/** Decide a request without changing anything. A grant carries the record to
+ *  archive and then apply(); a refusal carries why, and who it should reach. */
+export function decide(L, req, now) {
+  const from = String(req.from || "");
+  const resource = String(req.resource ?? "").trim();
+  if (!resource) return refuse("resource_required", "resource required", null);
+
+  const held = L.leases.get(resource);
+  const heldLive = held && live(held, now) ? held : null;
+
+  if (req.release) {
+    if (heldLive && heldLive.by !== from)
+      return refuse("not_holder", `held by ${heldLive.by}, not you`, null, { held_by: heldLive.by });
+    return { ok: true, record: { kind: "release", from, resource, at: iso(now) } };
+  }
+
+  const budgeted = req.box != null || req.cap_gib != null || req.minutes != null;
+  let box = null, cap = null, minutes = OLD_SHAPE_MINUTES, route = null;
+
+  if (budgeted) {
+    if (req.box == null) return refuse("cap_without_box", "a cap or a lease length needs a box", L.foreman);
+    box = String(req.box);
+    const row = L.budgets[box];
+    if (!row) return refuse("unknown_box", `no budget for box ${box}`, L.foreman);
+    route = row.route || L.foreman;
+    if (row.closed) return refuse("box_closed", row.closed, route, { box });
+    if (req.cap_gib == null) return refuse("cap_required", `a claim on ${box} names its cap in GiB`, route);
+    if (typeof req.cap_gib !== "number" || !Number.isFinite(req.cap_gib) || req.cap_gib < 0)
+      return refuse("bad_cap", `cap_gib must be a number of GiB, 0 or more (got ${JSON.stringify(req.cap_gib)})`, route);
+    if (req.minutes == null) return refuse("minutes_required", `a claim on ${box} names its expected minutes`, route);
+    const max = row.max_minutes ?? 1440;
+    if (typeof req.minutes !== "number" || !Number.isFinite(req.minutes) || req.minutes <= 0 || req.minutes > max)
+      return refuse("bad_minutes", `minutes must be more than 0 and at most ${max} on ${box} (got ${JSON.stringify(req.minutes)})`, route);
+    cap = req.cap_gib;
+    minutes = req.minutes;
+  }
+
+  if (heldLive && heldLive.by !== from)
+    return refuse("held", `${resource} is held by ${heldLive.by}`, route ?? (heldLive.box ? L.budgets[heldLive.box]?.route : null) ?? null, {
+      held_by: heldLive.by,
+      since: heldLive.since,
+      expires: heldLive.expires,
+    });
+
+  if (box !== null) {
+    const budget = L.budgets[box].mem_gib;
+    const use = inUse(L, box, now, resource);
+    if (use.gib + cap > budget)
+      return refuse("over_budget", `${box}: ${use.gib} GiB in use + ${cap} asked > ${budget} GiB budget`, route, {
+        box,
+        in_use_gib: use.gib,
+        asked_gib: cap,
+        budget_gib: budget,
+        holders: use.holders,
+      });
+  }
+
+  const since = heldLive ? heldLive.since : iso(now); // a renewal keeps when it began
+  return {
+    ok: true,
+    record: {
+      kind: "claim",
+      from,
+      resource,
+      box,
+      cap_gib: cap,
+      minutes,
+      since,
+      expires: iso(now + minutes * 60_000), // and runs from the renewal
+      at: iso(now),
+    },
+  };
+}
+
+/** Apply a granted record. The hub calls this after archiving it; replay()
+ *  calls it for each record read back from the archive. */
+export function apply(L, rec) {
+  if (rec.kind === "claim") {
+    L.leases.set(rec.resource, {
+      by: rec.from,
+      box: rec.box ?? null,
+      cap_gib: rec.cap_gib ?? null,
+      minutes: rec.minutes,
+      since: rec.since,
+      expires: rec.expires,
+    });
+  } else if (rec.kind === "release") {
+    const l = L.leases.get(rec.resource);
+    if (l && l.by === rec.from) L.leases.delete(rec.resource);
+  }
+}
+
+/** Drop expired leases; return what was dropped (resource, by, box, cap). */
+export function sweep(L, now) {
+  const gone = [];
+  for (const [r, l] of L.leases)
+    if (!live(l, now)) {
+      L.leases.delete(r);
+      gone.push({ resource: r, by: l.by, box: l.box, cap_gib: l.cap_gib, expires: l.expires });
+    }
+  return gone;
+}
+
+/** Rebuild from archive lines. Ordinary messages carry no ledger kind and are
+ *  skipped; expired leases come back and are dropped by the next sweep. */
+export function replay(budgets, records, opts = {}) {
+  const L = newLedger(budgets, opts);
+  for (const m of records) if (m && (m.kind === "claim" || m.kind === "release")) apply(L, m);
+  return L;
+}
+
+/** What the roster shows: live leases, and per budgeted box its sum. */
+export function view(L, now) {
+  const leases = {};
+  for (const [r, l] of [...L.leases].sort(([a], [b]) => (a < b ? -1 : 1)))
+    if (live(l, now)) leases[r] = { ...l };
+  const boxes = {};
+  for (const [box, row] of Object.entries(L.budgets)) {
+    if (row.closed) { boxes[box] = { closed: row.closed }; continue; }
+    const use = inUse(L, box, now);
+    boxes[box] = { budget_gib: row.mem_gib, in_use_gib: use.gib, free_gib: row.mem_gib - use.gib };
+  }
+  return { leases, boxes };
+}

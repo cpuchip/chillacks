@@ -1,0 +1,187 @@
+#!/usr/bin/env node
+/* test-ledger.mjs — the claims ledger, pure: no hub, no clock, no disk.
+ *
+ * The foreman was woken 109 times in one day to read claims and releases and
+ * ack them (wake census, 2026-10-16). Each was arithmetic: does this cap fit
+ * under the box's budget, is the thing already held. This file is that
+ * arithmetic as a table the hub can run without waking anyone.
+ *
+ * Every grant here has a refusal beside it that must go red if the rule is
+ * removed: a ledger that only ever says yes passes any test that only asks
+ * for a yes.
+ *
+ * Time is passed in, never read: a lease that expires is a test case, not a
+ * fifteen-minute wait.
+ */
+import { newLedger, decide, apply, sweep, view, replay } from "./claims.mjs";
+
+let fails = 0;
+const check = (label, ok, detail = "") => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${label}${detail ? "  — " + detail : ""}`);
+  if (!ok) fails++;
+};
+
+const FOREMAN = "foreman";
+const BUDGETS = {
+  boxa: { mem_gib: 16, max_minutes: 1440, route: "boxa-steward" },
+  boxb: { closed: "boxb's headroom is read from the box, and it has no monitor yet", route: "foreman" },
+};
+const T0 = Date.parse("2026-10-16T06:00:00Z");
+const min = (n) => n * 60_000;
+
+/** decide, and on a grant apply it, as the hub will. Returns the decision. */
+function claim(L, from, req, now = T0) {
+  const d = decide(L, { from, ...req }, now);
+  if (d.ok) apply(L, d.record);
+  return d;
+}
+
+// ── old shape: what every running shim sends today ─────────────────────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  const a = claim(L, "alice", { resource: ":8080" });
+  const b = claim(L, "bob", { resource: ":8080" });
+  check("old shape: first claim wins", a.ok === true, JSON.stringify(a));
+  check("old shape: second claim names the holder", b.ok === false && b.code === "held" && b.held_by === "alice", JSON.stringify(b));
+  check("old shape: unbudgeted, 15-minute lease", a.ok && a.record.box === null && a.record.cap_gib === null && a.record.minutes === 15);
+  sweep(L, T0 + min(16));
+  const c = claim(L, "bob", { resource: ":8080" }, T0 + min(16));
+  check("old shape: an expired lease frees the resource", c.ok === true, JSON.stringify(c));
+}
+
+// ── renewal extends the lease (the live hub keeps `since`, so it does not) ──
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  claim(L, "alice", { resource: ":8080" }, T0);
+  const r = claim(L, "alice", { resource: ":8080" }, T0 + min(10));
+  check("renewal by the holder is granted", r.ok === true);
+  sweep(L, T0 + min(20));
+  const b = claim(L, "bob", { resource: ":8080" }, T0 + min(20));
+  check("renewal extends expiry from the renewal, not the first claim", b.ok === false && b.code === "held", JSON.stringify(b));
+  check("renewal keeps the original since", r.ok && r.record.since === new Date(T0).toISOString(), r.ok && r.record.since);
+}
+
+// ── budgets: the sum of caps on a box stays under the box's figure ──────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  const a = claim(L, "carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 8, minutes: 60 });
+  const b = claim(L, "dave", { resource: "dave-build", box: "boxa", cap_gib: 6, minutes: 30 });
+  const c = claim(L, "erin", { resource: "erin-clang", box: "boxa", cap_gib: 4, minutes: 20 });
+  check("a claim that fits is granted", a.ok === true, JSON.stringify(a));
+  check("a second that still fits is granted (8+6=14 of 16)", b.ok === true, JSON.stringify(b));
+  check("one that would cross the budget is refused (14+4 > 16)", c.ok === false && c.code === "over_budget", JSON.stringify(c));
+  check("the refusal carries the sum, the budget and the holders",
+    !c.ok && c.in_use_gib === 14 && c.budget_gib === 16 && c.holders?.length === 2, JSON.stringify(c));
+  check("the refusal routes to the box's steward", !c.ok && c.route === "boxa-steward", JSON.stringify(c));
+  const d = claim(L, "erin", { resource: "erin-clang", box: "boxa", cap_gib: 2, minutes: 20 });
+  check("exactly at the budget is granted (14+2 = 16)", d.ok === true, JSON.stringify(d));
+  check("view sums the box", view(L, T0).boxes.boxa.in_use_gib === 16, JSON.stringify(view(L, T0).boxes));
+}
+
+// ── a release returns its cap to the box ───────────────────────────────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  claim(L, "carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 12, minutes: 60 });
+  const no = claim(L, "frank", { resource: "frank-doc", box: "boxa", cap_gib: 8, minutes: 10 });
+  const notHolder = claim(L, "frank", { resource: "carol-mut-1", release: true });
+  const rel = claim(L, "carol", { resource: "carol-mut-1", release: true });
+  const yes = claim(L, "frank", { resource: "frank-doc", box: "boxa", cap_gib: 8, minutes: 10 });
+  check("over budget before the release", no.ok === false && no.code === "over_budget");
+  check("a non-holder cannot release", notHolder.ok === false && notHolder.code === "not_holder", JSON.stringify(notHolder));
+  check("the holder can release", rel.ok === true && rel.record.kind === "release");
+  check("after the release the same claim fits", yes.ok === true, JSON.stringify(yes));
+  const again = claim(L, "carol", { resource: "carol-mut-1", release: true });
+  check("releasing what nobody holds is ok and changes nothing", again.ok === true && view(L, T0).boxes.boxa.in_use_gib === 8);
+}
+
+// ── an expired lease returns its cap ───────────────────────────────────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  claim(L, "carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 12, minutes: 30 }, T0);
+  const early = claim(L, "frank", { resource: "frank-doc", box: "boxa", cap_gib: 8, minutes: 10 }, T0 + min(29));
+  const late = claim(L, "frank", { resource: "frank-doc", box: "boxa", cap_gib: 8, minutes: 10 }, T0 + min(31));
+  check("a live lease still counts at minute 29", early.ok === false && early.code === "over_budget");
+  check("an expired lease no longer counts at minute 31", late.ok === true, JSON.stringify(late));
+  const gone = sweep(L, T0 + min(31));
+  check("sweep reports what it dropped", gone.length === 1 && gone[0].resource === "carol-mut-1", JSON.stringify(gone));
+}
+
+// ── renewal re-checks the budget without counting itself twice ─────────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  claim(L, "carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 10, minutes: 60 });
+  claim(L, "dave", { resource: "dave-build", box: "boxa", cap_gib: 4, minutes: 60 });
+  const same = claim(L, "carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 10, minutes: 60 }, T0 + min(5));
+  const grow = claim(L, "carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 13, minutes: 60 }, T0 + min(6));
+  check("renewing at the same cap is granted (own cap not double-counted)", same.ok === true, JSON.stringify(same));
+  check("renewing to a cap that no longer fits is refused (4+13 > 16)", grow.ok === false && grow.code === "over_budget", JSON.stringify(grow));
+  check("a refused renewal leaves the old lease intact", view(L, T0 + min(6)).boxes.boxa.in_use_gib === 14);
+}
+
+// ── the shape of a budgeted claim ──────────────────────────────────────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  const cases = [
+    ["a box with no budget row", { resource: "x-1", box: "boxc", cap_gib: 1, minutes: 5 }, "unknown_box"],
+    ["a cap on a budgeted box is required", { resource: "x-2", box: "boxa", minutes: 5 }, "cap_required"],
+    ["minutes on a budgeted box are required", { resource: "x-3", box: "boxa", cap_gib: 1 }, "minutes_required"],
+    ["a negative cap", { resource: "x-4", box: "boxa", cap_gib: -1, minutes: 5 }, "bad_cap"],
+    ["a cap that is not a number", { resource: "x-5", box: "boxa", cap_gib: "8g", minutes: 5 }, "bad_cap"],
+    ["zero minutes", { resource: "x-6", box: "boxa", cap_gib: 1, minutes: 0 }, "bad_minutes"],
+    ["a lease longer than the box allows", { resource: "x-7", box: "boxa", cap_gib: 1, minutes: 1441 }, "bad_minutes"],
+    ["a cap with no box", { resource: "x-8", cap_gib: 4, minutes: 5 }, "cap_without_box"],
+    ["no resource", { box: "boxa", cap_gib: 1, minutes: 5 }, "resource_required"],
+  ];
+  for (const [label, req, code] of cases) {
+    const d = claim(L, "probe", req);
+    check(`refused: ${label}`, d.ok === false && d.code === code, JSON.stringify(d));
+  }
+  check("no refusal left a lease behind", Object.keys(view(L, T0).leases).length === 0);
+  const unknown = claim(L, "probe", { resource: "x-1", box: "boxc", cap_gib: 1, minutes: 5 });
+  check("an unknown box routes to the foreman", unknown.route === "foreman", JSON.stringify(unknown));
+}
+
+// ── a closed box refuses everything and routes ─────────────────────────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  const d = claim(L, "heidi", { resource: "heidi-judge", box: "boxb", cap_gib: 4, minutes: 30 });
+  check("boxb refuses until its monitor reports", d.ok === false && d.code === "box_closed", JSON.stringify(d));
+  check("and routes to the foreman with the reason", d.route === "foreman" && /monitor/.test(d.reason), JSON.stringify(d));
+}
+
+// ── a held resource is refused even when the budget has room ───────────────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  claim(L, "carol", { resource: "boxa-gpu", box: "boxa", cap_gib: 0, minutes: 120 });
+  const d = claim(L, "grace", { resource: "boxa-gpu", box: "boxa", cap_gib: 0, minutes: 30 });
+  check("one holder per card", d.ok === false && d.code === "held" && d.held_by === "carol", JSON.stringify(d));
+  check("and it routes to the box's steward", d.route === "boxa-steward", JSON.stringify(d));
+}
+
+// ── replay: the ledger rebuilt from its own records is the same ledger ──────
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  const log = [];
+  const step = (from, req, now) => {
+    const d = decide(L, { from, ...req }, now);
+    if (d.ok) { apply(L, d.record); log.push(JSON.parse(JSON.stringify(d.record))); }
+  };
+  step("carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 8, minutes: 60 }, T0);
+  step("dave", { resource: "dave-build", box: "boxa", cap_gib: 6, minutes: 30 }, T0 + min(1));
+  step("alice", { resource: ":8080" }, T0 + min(2));
+  step("dave", { resource: "dave-build", release: true }, T0 + min(3));
+  step("carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 8, minutes: 90 }, T0 + min(4));
+  // the archive also holds every ordinary message; replay must skip them
+  const archive = [{ id: 1, from: "x", to: null, text: "hello", ts: new Date(T0).toISOString() }, ...log];
+  const R = replay(BUDGETS, archive, { foreman: FOREMAN });
+  const at = T0 + min(5);
+  check("replay rebuilds the same leases", JSON.stringify(view(R, at)) === JSON.stringify(view(L, at)),
+    `\n   live   ${JSON.stringify(view(L, at))}\n   replay ${JSON.stringify(view(R, at))}`);
+  check("replay keeps the renewed expiry", view(R, at).leases["carol-mut-1"]?.expires === new Date(T0 + min(94)).toISOString(),
+    JSON.stringify(view(R, at).leases["carol-mut-1"]));
+  const after = decide(R, { from: "frank", resource: "frank-doc", box: "boxa", cap_gib: 9, minutes: 10 }, at);
+  check("a replayed ledger refuses what the live one would (8+9 > 16)", after.ok === false && after.code === "over_budget");
+}
+
+console.log(fails ? `\n${fails} FAILURE(S)` : "\nALL GREEN — ledger: budgets, leases, refusals, replay.");
+process.exit(fails ? 1 : 0);
