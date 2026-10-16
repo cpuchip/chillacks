@@ -245,7 +245,15 @@ fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 
 function loadArchive() {
   if (!fs.existsSync(ARCHIVE)) return 0;
-  const lines = fs.readFileSync(ARCHIVE, "utf8").split("\n").filter(Boolean);
+  const raw = fs.readFileSync(ARCHIVE, "utf8");
+  // A crash mid-append leaves a last line with no newline, and the next append
+  // would join it: both would then be skipped as one bad line, and a grant with
+  // them. End the torn line first; its bytes stay, on a line of their own.
+  if (raw.length && !raw.endsWith("\n")) {
+    fs.appendFileSync(ARCHIVE, "\n");
+    console.error(`[chillacks] archive: last line had no newline (a torn write) — ended it before appending`);
+  }
+  const lines = raw.split("\n").filter(Boolean);
   let bad = 0;
   for (const line of lines) {
     try {
@@ -264,13 +272,23 @@ function loadArchive() {
   return lines.length;
 }
 
-function archive(msg) {
+/** Append one record. Returns true when it is in the file. `sync` also
+ *  fsyncs it: a ledger grant is state, and a grant lost to a power cut after
+ *  its 200 is a running job the budget no longer counts. */
+function archive(msg, { sync = false } = {}) {
   // Append before delivering. A message the room saw but the record didn't
   // would make the archive a liar, which is worse than a slow write.
+  let fd = null;
   try {
-    fs.appendFileSync(ARCHIVE, JSON.stringify(msg) + "\n");
+    fd = fs.openSync(ARCHIVE, "a");
+    fs.writeSync(fd, JSON.stringify(msg) + "\n");
+    if (sync) fs.fsyncSync(fd);
+    return true;
   } catch (e) {
     console.error(`[chillacks] ARCHIVE WRITE FAILED: ${e.message}`);
+    return false;
+  } finally {
+    if (fd !== null) try { fs.closeSync(fd); } catch {}
   }
 }
 
@@ -280,11 +298,15 @@ sweep(ledger, Date.now());
 /** Archive a ledger record. It is the record of a grant, a release or a
  *  refusal, so it gets an id like any message, and it is delivered to nobody
  *  and kept out of history: a seat catching up reads the conversation. */
-function ledgerRecord(fields) {
+function ledgerRecord(fields, { sync = false } = {}) {
+  const size = (() => { try { return fs.statSync(ARCHIVE).size; } catch { return 0; } })();
   const msg = { id: ++seq, to: null, channel: null, ...fields, ts: new Date().toISOString() };
-  archive(msg);
-  seen.add(msg.from);
-  return msg;
+  const ok = archive(msg, { sync });
+  // Nothing reached the file: take the id back, so the archive shows no gap
+  // for a record that was never made. A partial write keeps its id.
+  if (!ok && (() => { try { return fs.statSync(ARCHIVE).size === size; } catch { return true; } })()) seq--;
+  else seen.add(msg.from);
+  return { msg, ok };
 }
 
 function claimText(r) {
@@ -837,12 +859,26 @@ const server = http.createServer(async (req, res) => {
     }
     const r = d.record;
     if (r.kind === "release") {
-      apply(ledger, ledgerRecord({ from, kind: "release", resource: r.resource, text: `release ${r.resource}` }));
+      // A release that the archive did not take still applies here; that fails
+      // safe, since the lease comes back at the next start and refuses more.
+      apply(ledger, ledgerRecord({ from, kind: "release", resource: r.resource, text: `release ${r.resource}` }, { sync: true }).msg);
       console.error(`[chillacks] ${from} released ${r.resource}`);
       return json(200, { ok: true, released: r.resource });
     }
     const { at: _at, ...fields } = r;
-    apply(ledger, ledgerRecord({ ...fields, text: claimText(r) }));
+    const rec = ledgerRecord({ ...fields, text: claimText(r) }, { sync: true });
+    if (!rec.ok) {
+      // Granted but not recorded would be forgotten at the next start.
+      console.error(`[chillacks] ${from} ${claimText(r)}: REFUSED, the archive did not take it`);
+      return json(503, {
+        ok: false,
+        code: "not_recorded",
+        reason: "the hub could not record this grant, so it was not made; try again",
+        route: null,
+        error: "not recorded",
+      });
+    }
+    apply(ledger, rec.msg);
     console.error(`[chillacks] ${from} ${claimText(r)}`);
     return json(200, {
       ok: true,

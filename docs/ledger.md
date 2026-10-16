@@ -127,6 +127,19 @@ rewritten with this reason.
 Refusals are archived too (`kind: "claim-refused"`, with the code), because "how often was the
 ledger asked for something it said no to" is the number that says whether a budget is right.
 
+Because a lost grant is a running job the budget no longer counts, the write is held to more than
+an ordinary message's:
+
+- a grant the archive does not take (a full disk, a permission, a scanner's lock) is refused with
+  `not_recorded` (HTTP 503) and not applied; if nothing reached the file, its id is taken back, so
+  the archive shows no gap for a record that was never made;
+- a release the archive does not take still applies in memory. That fails safe: the lease comes back
+  at the next start and the box refuses more, never less;
+- grants and releases are fsynced before the reply. Measured on one box's NVMe, 200 appends of a
+  ledger record: append alone p50 0.005 ms; append and fsync p50 0.68 ms, p95 0.96 ms, worst 2.6 ms;
+- a last line with no newline (a crash mid-append) is ended on load before anything is appended, so
+  the next record starts its own line instead of being skipped with the torn one.
+
 The archive is now state as well as record: trimming `room.jsonl` by hand drops the leases recorded
 in the trimmed part, and the next start grants as if those jobs had ended.
 

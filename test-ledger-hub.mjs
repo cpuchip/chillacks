@@ -224,5 +224,38 @@ await settle(600);
 const ro2 = await get("/roster");
 check("an unreadable budget file keeps the last good table", ro2.budgets?.boxa?.budget_gib === 32, JSON.stringify(ro2.budgets));
 
+// ── R1 (threadchip #8842): a grant the archive did not take is refused ─────
+// A grant that is applied but not recorded is forgotten at the next start, and
+// the budget then grants past a running job. EACCES here stands in for ENOSPC
+// or a scanner's lock.
+fs.chmodSync(ARCHIVE, 0o444);
+const unrec = await post(A, "/claim", { resource: "alice-unrec", box: "boxa", cap_gib: 1, minutes: 5 });
+fs.chmodSync(ARCHIVE, 0o644);
+check("a grant whose archive write fails is refused (503 not_recorded)", unrec.status === 503 && unrec.ok === false && unrec.code === "not_recorded", JSON.stringify(unrec));
+check("and is not applied", !(await get("/roster")).claims?.["alice-unrec"], JSON.stringify((await get("/roster")).claims));
+const lastId = archived().at(-1).id;
+const nextMsg = await post(A, "/send", { to: B, text: "after a refused grant" });
+check("the refused grant left no gap in the archive's ids", nextMsg.id === lastId + 1, `last ${lastId}, next ${nextMsg.id}`);
+
+// ── R2 (threadchip #8842): a torn last line does not swallow the next record ─
+// A crash mid-append leaves a line with no newline; the next append would join
+// it, and the restart would skip both as one unparseable line.
+for (const s of streams) s.abort();
+hub.kill();
+await settle(400);
+fs.writeFileSync(BUDGETS_FILE, JSON.stringify({ ...BUDGETS, boxa: { ...BUDGETS.boxa, mem_gib: 32 } })); // the block above left it unreadable
+fs.appendFileSync(ARCHIVE, '{"id":999999,"from":"bob","to":null,"chan');
+hub = startHub();
+await waitUp(hub);
+const torn = await post(C, "/claim", { resource: "carol-after-tear", box: "boxa", cap_gib: 0, minutes: 30 });
+check("a grant after a torn line is granted", torn.ok === true, JSON.stringify(torn));
+hub.kill();
+await settle(400);
+hub = startHub();
+await waitUp(hub);
+check("and survives the next restart", (await get("/roster")).claims?.["carol-after-tear"]?.by === C, JSON.stringify((await get("/roster")).claims));
+check("the torn bytes stay in the file, on their own line",
+  fs.readFileSync(ARCHIVE, "utf8").split("\n").includes('{"id":999999,"from":"bob","to":null,"chan'));
+
 console.log(fails ? `\n${fails} FAILURE(S)` : "\nALL GREEN — the ledger over the wire: grants, refusals, archive, restart.");
 process.exit(fails ? 1 : 0);
