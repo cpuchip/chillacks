@@ -72,7 +72,7 @@ function claim(L, from, req, now = T0) {
   check("one that would cross the budget is refused (14+4 > 16)", c.ok === false && c.code === "over_budget", JSON.stringify(c));
   check("the refusal carries the sum, the budget and the holders",
     !c.ok && c.in_use_gib === 14 && c.budget_gib === 16 && c.holders?.length === 2, JSON.stringify(c));
-  check("the refusal routes to the box's steward", !c.ok && c.route === "boxa-steward", JSON.stringify(c));
+  check("a full box wakes nobody (route null; the claimant retries)", !c.ok && c.route === null, JSON.stringify(c));
   const d = claim(L, "erin", { resource: "erin-clang", box: "boxa", cap_gib: 2, minutes: 20 });
   check("exactly at the budget is granted (14+2 = 16)", d.ok === true, JSON.stringify(d));
   check("view sums the box", view(L, T0).boxes.boxa.in_use_gib === 16, JSON.stringify(view(L, T0).boxes));
@@ -137,6 +137,8 @@ function claim(L, from, req, now = T0) {
     check(`refused: ${label}`, d.ok === false && d.code === code, JSON.stringify(d));
   }
   check("no refusal left a lease behind", Object.keys(view(L, T0).leases).length === 0);
+  const malformed = claim(L, "probe", { resource: "x-8", cap_gib: 4, minutes: 5 });
+  check("a malformed claim wakes nobody (route null)", malformed.code === "cap_without_box" && malformed.route === null, JSON.stringify(malformed));
   const unknown = claim(L, "probe", { resource: "x-1", box: "boxc", cap_gib: 1, minutes: 5 });
   check("an unknown box routes to the foreman", unknown.route === "foreman", JSON.stringify(unknown));
 }
@@ -155,7 +157,52 @@ function claim(L, from, req, now = T0) {
   claim(L, "carol", { resource: "boxa-gpu", box: "boxa", cap_gib: 0, minutes: 120 });
   const d = claim(L, "grace", { resource: "boxa-gpu", box: "boxa", cap_gib: 0, minutes: 30 });
   check("one holder per card", d.ok === false && d.code === "held" && d.held_by === "carol", JSON.stringify(d));
-  check("and it routes to the box's steward", d.route === "boxa-steward", JSON.stringify(d));
+  check("a held card wakes nobody (route null)", d.route === null, JSON.stringify(d));
+}
+
+// ── an old-shape renewal keeps the lease's box, cap and minutes (threadchip #8833 A) ──
+// Every running shim sends only {resource}. A holder renewing that way must not
+// turn an 8 GiB, 60-minute lease into an unbudgeted 15-minute one: its cap would
+// stop counting and the job would lose its lease at minute 20.
+{
+  const L = newLedger(BUDGETS, { foreman: FOREMAN });
+  claim(L, "carol", { resource: "carol-mut-1", box: "boxa", cap_gib: 8, minutes: 60 }, T0);
+  const ren = claim(L, "carol", { resource: "carol-mut-1" }, T0 + min(5));
+  check("an old-shape renewal of a budgeted lease is granted", ren.ok === true, JSON.stringify(ren));
+  check("and keeps its box, cap and minutes", ren.ok && ren.record.box === "boxa" && ren.record.cap_gib === 8 && ren.record.minutes === 60, JSON.stringify(ren));
+  check("and runs from the renewal (T0+65)", ren.ok && ren.record.expires === new Date(T0 + min(65)).toISOString(), ren.ok && ren.record.expires);
+  check("its cap still counts", view(L, T0 + min(5)).boxes.boxa.in_use_gib === 8, JSON.stringify(view(L, T0 + min(5)).boxes.boxa));
+  const f = claim(L, "frank", { resource: "frank-doc", box: "boxa", cap_gib: 9, minutes: 10 }, T0 + min(6));
+  check("so the budget still refuses past it (8+9 > 16)", f.ok === false && f.code === "over_budget", JSON.stringify(f));
+  sweep(L, T0 + min(21));
+  const g = claim(L, "grace", { resource: "carol-mut-1" }, T0 + min(21));
+  check("and the lease is still held at minute 21", g.ok === false && g.code === "held" && g.held_by === "carol", JSON.stringify(g));
+}
+
+// ── the budget fails closed (threadchip #8833 B) ───────────────────────────
+{
+  const odd = {
+    ...BUDGETS,
+    boxf: { floor_gib: 8, route: "s" },
+    boxg: { mem_gib: "16", route: "s" },
+    boxh: { mem_gib: -4, route: "s" },
+    boxi: "not a row",
+  };
+  const L = newLedger(odd, { foreman: FOREMAN });
+  for (const box of ["boxf", "boxg", "boxh", "boxi"]) {
+    const d = claim(L, "probe", { resource: `p-${box}`, box, cap_gib: 1000, minutes: 5 });
+    check(`a row without a usable mem_gib refuses (${box})`, d.ok === false && d.code === "bad_budget" && d.route === FOREMAN, JSON.stringify(d));
+  }
+  for (const box of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+    const d = claim(L, "probe", { resource: `p-${box}`, box, cap_gib: 1000, minutes: 5 });
+    check(`a box name on Object.prototype is unknown (${box})`, d.ok === false && d.code === "unknown_box", JSON.stringify(d));
+  }
+  const parsed = newLedger(JSON.parse('{"__proto__": {"mem_gib": 999}, "boxa": {"mem_gib": 16}}'), { foreman: FOREMAN });
+  const pp = claim(parsed, "probe", { resource: "p-pp", box: "__proto__", cap_gib: 500, minutes: 5 });
+  check("a JSON row named __proto__ is not a budget", pp.ok === false, JSON.stringify(pp));
+  const v = view(L, T0);
+  check("view marks an unusable row instead of showing a free figure", v.boxes.boxf?.invalid && v.boxes.boxf.free_gib === undefined, JSON.stringify(v.boxes.boxf));
+  check("no refusal above left a lease", Object.keys(v.leases).length === 0);
 }
 
 // ── replay: the ledger rebuilt from its own records is the same ledger ──────

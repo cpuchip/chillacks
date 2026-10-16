@@ -42,6 +42,26 @@ function inUse(L, box, now, except = null) {
 
 const refuse = (code, reason, route, extra = {}) => ({ ok: false, code, reason, route, ...extra });
 
+const BOX_NAME = /^[a-z0-9][a-z0-9_.-]*$/i;
+
+/** The box's own row, or null. A plain object inherits names like
+ *  `constructor`, and JSON.parse makes `__proto__` an own key, so a row
+ *  counts only when it is the table's own and the name is a plain one. */
+function rowFor(L, box) {
+  if (!BOX_NAME.test(box) || !Object.hasOwn(L.budgets, box)) return null;
+  return L.budgets[box];
+}
+
+/** Why a row cannot grant, or null when it can. A row with no usable
+ *  mem_gib refuses: `cap > undefined` is false, so it would grant anything. */
+function rowProblem(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return "the row is not an object";
+  if (row.closed) return null;
+  if (!Number.isFinite(row.mem_gib) || row.mem_gib < 0)
+    return `mem_gib must be a number of GiB, 0 or more (got ${JSON.stringify(row.mem_gib)})`;
+  return null;
+}
+
 /** Decide a request without changing anything. A grant carries the record to
  *  archive and then apply(); a refusal carries why, and who it should reach. */
 export function decide(L, req, now) {
@@ -58,16 +78,24 @@ export function decide(L, req, now) {
     return { ok: true, record: { kind: "release", from, resource, at: iso(now) } };
   }
 
-  const budgeted = req.box != null || req.cap_gib != null || req.minutes != null;
+  // A holder renewing with the old shape (every running shim sends only
+  // `resource`) keeps its lease's box, cap and minutes. Without this the
+  // renewal would turn a budgeted lease into an unbudgeted 15-minute one.
+  const bare = req.box == null && req.cap_gib == null && req.minutes == null;
+  if (bare && heldLive && heldLive.by === from && heldLive.box != null)
+    req = { ...req, box: heldLive.box, cap_gib: heldLive.cap_gib, minutes: heldLive.minutes };
+  const budgeted = !bare || req.box != null;
   let box = null, cap = null, minutes = OLD_SHAPE_MINUTES, route = null;
 
   if (budgeted) {
-    if (req.box == null) return refuse("cap_without_box", "a cap or a lease length needs a box", L.foreman);
+    if (req.box == null) return refuse("cap_without_box", "a cap or a lease length needs a box", null); // malformed: the claimant fixes its call
     box = String(req.box);
-    const row = L.budgets[box];
+    const row = rowFor(L, box);
     if (!row) return refuse("unknown_box", `no budget for box ${box}`, L.foreman);
+    const problem = rowProblem(row);
+    if (problem) return refuse("bad_budget", `${box}'s budget row is unusable: ${problem}`, L.foreman, { box });
     route = row.route || L.foreman;
-    if (row.closed) return refuse("box_closed", row.closed, route, { box });
+    if (row.closed) return refuse("box_closed", String(row.closed), route, { box });
     if (req.cap_gib == null) return refuse("cap_required", `a claim on ${box} names its cap in GiB`, route);
     if (typeof req.cap_gib !== "number" || !Number.isFinite(req.cap_gib) || req.cap_gib < 0)
       return refuse("bad_cap", `cap_gib must be a number of GiB, 0 or more (got ${JSON.stringify(req.cap_gib)})`, route);
@@ -80,17 +108,18 @@ export function decide(L, req, now) {
   }
 
   if (heldLive && heldLive.by !== from)
-    return refuse("held", `${resource} is held by ${heldLive.by}`, route ?? (heldLive.box ? L.budgets[heldLive.box]?.route : null) ?? null, {
+    // held and over_budget wake nobody: the claimant has what it needs to retry (docs §5)
+    return refuse("held", `${resource} is held by ${heldLive.by}`, null, {
       held_by: heldLive.by,
       since: heldLive.since,
       expires: heldLive.expires,
     });
 
   if (box !== null) {
-    const budget = L.budgets[box].mem_gib;
+    const budget = rowFor(L, box).mem_gib;
     const use = inUse(L, box, now, resource);
     if (use.gib + cap > budget)
-      return refuse("over_budget", `${box}: ${use.gib} GiB in use + ${cap} asked > ${budget} GiB budget`, route, {
+      return refuse("over_budget", `${box}: ${use.gib} GiB in use + ${cap} asked > ${budget} GiB budget`, null, {
         box,
         in_use_gib: use.gib,
         asked_gib: cap,
@@ -159,7 +188,11 @@ export function view(L, now) {
   for (const [r, l] of [...L.leases].sort(([a], [b]) => (a < b ? -1 : 1)))
     if (live(l, now)) leases[r] = { ...l };
   const boxes = {};
-  for (const [box, row] of Object.entries(L.budgets)) {
+  for (const box of Object.keys(L.budgets)) {
+    const row = rowFor(L, box);
+    if (!row) continue;
+    const problem = rowProblem(row);
+    if (problem) { boxes[box] = { invalid: problem }; continue; }
     if (row.closed) { boxes[box] = { closed: row.closed }; continue; }
     const use = inUse(L, box, now);
     boxes[box] = { budget_gib: row.mem_gib, in_use_gib: use.gib, free_gib: row.mem_gib - use.gib };
