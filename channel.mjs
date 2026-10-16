@@ -219,10 +219,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chillacks_quiet",
       description:
-        "Quiet windows are held back for now: the hub answers that they wait until " +
-        "held messages survive a hub restart and a dropped stream. When they return: " +
-        "the hub holds your DMs and acks for this many seconds after the first one " +
-        "arrives, then delivers them as one wake.",
+        "Set a quiet window: the hub holds your DMs and acks for this many seconds " +
+        "after the first one arrives, then delivers them as one wake. Channel and " +
+        "#all messages are never held. 0 turns it off and delivers anything held.",
       inputSchema: {
         type: "object",
         properties: {

@@ -72,6 +72,8 @@ function addStream(name, m) {
   set.add(m);
   const tag = m.kind === "ws" ? " (ws)" : "";
   console.error(`[chillacks] + ${name}${tag}  (${members.size} present)`);
+  // a batch whose window closed while this seat had no stream goes now
+  if (held.get(name)?.pending) setImmediate(() => flush(name));
   if (set.size > 1)
     console.error(
       `[chillacks] ! ${name} holds ${set.size} streams, all receive; if this persists, a second session is carrying this seat name`,
@@ -130,15 +132,8 @@ const QUIET_MAX_S = 900;
 const quiet = new Map();
 /** name -> { msgs: [], timer } */
 const held = new Map();
-// Held back (2026-10-16): held DMs were lost on a hub restart, and when the
-// recipient's stream was down at the close, while the sender had been told
-// they were delivered. Until both are fixed, /quiet answers 501 and quiet.json
-// is not loaded, so nothing is ever held.
-const QUIET_HELD_BACK = "quiet windows held back until held messages survive a restart and a dropped stream";
 try {
-  if (QUIET_HELD_BACK) {
-    if (fs.existsSync(QUIET_FILE)) console.error(`[chillacks] ${QUIET_FILE} not loaded: ${QUIET_HELD_BACK}`);
-  } else if (fs.existsSync(QUIET_FILE))
+  if (fs.existsSync(QUIET_FILE))
     for (const [n, sec] of Object.entries(JSON.parse(fs.readFileSync(QUIET_FILE, "utf8"))))
       if (Number.isFinite(sec) && sec > 0 && sec <= QUIET_MAX_S) quiet.set(n, sec);
 } catch (e) {
@@ -156,6 +151,21 @@ function saveQuiet() {
 // The archive says what was sent; once a window folds five DMs into one, it can
 // no longer say how many times a seat was woken. This file can.
 const WAKES = process.env.CHILLACKS_WAKES || path.join(ARCHIVE_DIR, "wakes.jsonl");
+/** A hold is logged beside the wakes (a line with `held`, not `ids`), so a
+ *  restarted hub can deliver what was held and never delivered. */
+function logHold(to, id) {
+  try {
+    fs.appendFileSync(WAKES, JSON.stringify({ ts: new Date().toISOString(), to, held: [id] }) + "\n");
+  } catch (e) {
+    console.error(`[chillacks] wakes.jsonl write failed: ${e.message}`);
+  }
+}
+// A held message older than this when its recipient can finally be reached is
+// dropped (it stays in the archive); a restart recovers nothing older either.
+const HELD_MAX_S = Number(process.env.CHILLACKS_HELD_MAX_S || 1800);
+/** recent DMs and acks by id, filled while the archive loads, for recovery */
+const recentDMs = new Map();
+
 function logWake(to, ids) {
   try {
     fs.appendFileSync(WAKES, JSON.stringify({ ts: new Date().toISOString(), to, ids }) + "\n");
@@ -270,6 +280,7 @@ function loadArchive() {
       if (m.id > seq) seq = m.id;
       if (LEDGER_KINDS.has(m.kind)) apply(ledger, m); // replay; a refusal changes nothing
       else history.push(m);
+      if (m.to && m.id && Date.parse(m.ts) >= Date.now() - HELD_MAX_S * 1000) recentDMs.set(m.id, m);
     } catch {
       bad++; // a torn final write survives as one skipped line, not a dead hub
     }
@@ -301,6 +312,34 @@ function archive(msg, { sync = false } = {}) {
 
 const restored = loadArchive();
 sweep(ledger, Date.now());
+recoverHeld();
+
+/** After a crash: what was held (a `held` line) and never delivered (no wake
+ *  line carries its id) waits for its seat's next connection. By set of ids:
+ *  an #all delivered after a held DM must not mark the DM delivered. */
+function recoverHeld() {
+  if (!fs.existsSync(WAKES)) return;
+  const heldIds = new Map(), done = new Map();
+  for (const line of fs.readFileSync(WAKES, "utf8").split("\n")) {
+    let w;
+    try { w = JSON.parse(line); } catch { continue; }
+    if (!w?.to) continue;
+    const into = w.held ? heldIds : done;
+    if (!into.has(w.to)) into.set(w.to, new Set());
+    for (const id of w.held || w.ids || []) into.get(w.to).add(id);
+  }
+  for (const [name, ids] of heldIds) {
+    const msgs = [...ids]
+      .filter((id) => !done.get(name)?.has(id))
+      .map((id) => recentDMs.get(id))
+      .filter(Boolean)
+      .sort((a, b) => a.id - b.id);
+    if (!msgs.length) continue;
+    held.set(name, { msgs, timer: null, pending: true });
+    console.error(`[chillacks] recovered ${msgs.length} held message(s) for ${name}; delivered at its next connection`);
+  }
+  recentDMs.clear();
+}
 
 /** Archive a ledger record. It is the record of a grant, a release or a
  *  refusal, so it gets an id like any message, and it is delivered to nobody
@@ -484,6 +523,7 @@ function hold(name, msg) {
     held.set(name, h);
   }
   h.msgs.push(msg);
+  logHold(name, msg.id);
 }
 
 /** Deliver what a window held: the message itself when there was one, else
@@ -495,9 +535,23 @@ function flush(name) {
   const h = held.get(name);
   if (!h) return;
   clearTimeout(h.timer);
-  held.delete(name);
+  h.timer = null;
   const set = members.get(name);
-  if (!set?.size) return;
+  if (!set?.size) {
+    // The sender was told "delivered"; keep the batch for the seat's return.
+    if (!h.pending) console.error(`[chillacks] ${name} is away; ${h.msgs.length} held message(s) wait for its next connection`);
+    h.pending = true;
+    return;
+  }
+  held.delete(name);
+  const cutoff = Date.now() - HELD_MAX_S * 1000;
+  const fresh = h.msgs.filter((m) => Date.parse(m.ts) >= cutoff);
+  if (fresh.length < h.msgs.length)
+    console.error(
+      `[chillacks] ${name}: dropped ${h.msgs.length - fresh.length} held message(s) older than ${HELD_MAX_S} s; they are in the archive`,
+    );
+  if (!fresh.length) return;
+  h.msgs = fresh;
   const ids = h.msgs.map((m) => m.id);
   const out =
     h.msgs.length === 1
@@ -761,7 +815,6 @@ const server = http.createServer(async (req, res) => {
     }
     const name = AUTH ? who : p.from;
     if (!name) return json(400, { error: "from required" });
-    if (QUIET_HELD_BACK) return json(501, { ok: false, error: QUIET_HELD_BACK });
     const sec = p.seconds;
     if (typeof sec !== "number" || !Number.isFinite(sec) || sec < 0 || sec > QUIET_MAX_S)
       return json(400, { error: `seconds must be a number from 0 to ${QUIET_MAX_S}` });
@@ -1027,6 +1080,17 @@ server.on("upgrade", (req, socket) => {
   socket.on("close", bye);
   socket.on("error", bye);
 });
+
+// A clean stop delivers what windows hold before the streams close. A forced
+// kill (Stop-Process -Force on Windows, SIGKILL) runs no handler; recoverHeld()
+// covers that at the next start.
+for (const sig of ["SIGTERM", "SIGINT"])
+  process.on(sig, () => {
+    const n = held.size;
+    for (const name of [...held.keys()]) flush(name);
+    if (n) console.error(`[chillacks] ${sig}: flushed ${n} quiet window(s) before exit`);
+    setTimeout(() => process.exit(0), 150);
+  });
 
 server.listen(PORT, HOST, () => {
   console.error(

@@ -185,12 +185,14 @@ const sst = await alice.callTool({ name: "chillacks_send", arguments: { text: "d
 await settle(400);
 check("send status=true records a status", /^status recorded as alice \(msg #\d+\); delivered to nobody/.test(said(sst)), said(sst));
 check("and wakes nobody", inbox[B].length === bobSeen, `${bobSeen} -> ${inbox[B].length}`);
-// quiet windows are held back (threadchip #8849): the tool says so, nothing is held
 const qon = await bob.callTool({ name: "chillacks_quiet", arguments: { seconds: 1 } });
-check("quiet tool says windows are held back", /^not set: quiet windows held back until/.test(said(qon)) && !qon.isError, said(qon));
-const qdm = await alice.callTool({ name: "chillacks_send", arguments: { to: B, text: "not held" } });
-await settle(400);
-check("and a DM arrives at once, not reported held", !/held up to/.test(said(qdm)) && inbox[B].some((n) => n.content === "not held"), said(qdm));
+check("quiet tool sets a window", /^quiet window 1 s/.test(said(qon)), said(qon));
+const qdm = await alice.callTool({ name: "chillacks_send", arguments: { to: B, text: "held one" } });
+check("a DM into a window says it is held", /held up to 1 s by bob's quiet window/.test(said(qdm)), said(qdm));
+await settle(1400);
+check("and arrives after the window", inbox[B].some((n) => n.content === "held one"));
+const qoff = await bob.callTool({ name: "chillacks_quiet", arguments: { seconds: 0 } });
+check("quiet tool turns it off", /^quiet window off/.test(said(qoff)), said(qoff));
 
 // selftest echoes only to the sender
 const beforeSelf = inbox[A].length, bobBefore = inbox[B].length;

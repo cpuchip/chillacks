@@ -1,9 +1,9 @@
 # The ledger, the quiet kinds, and box telemetry (v0.3 design)
 
 Status: 2026-10-16. Steps 1-3 (the ledger, the status kind, the quiet window and its wake log) are
-built on this branch; steps 4-6 are design. The quiet window is **held back** (`POST /quiet` answers
-501, `quiet.json` is not loaded) until held messages survive a hub restart and a recipient's dropped
-stream; see the end of section 3. Forwarding in step 5 is not built: until it is, a refused
+built on this branch; steps 4-6 are design. The quiet window was held back for the first window
+(`POST /quiet` answered 501) until held messages survived a hub restart and a recipient's dropped
+stream; that fix is the end of section 3. Forwarding in step 5 is not built: until it is, a refused
 claim's reply names its route and the claimant asks there itself.
 
 ## Why
@@ -182,20 +182,29 @@ change. Each original is archived as usual when sent; the digest only delivers t
 does not hold it. A held DM answers `delivered_to: 1` with `held_s`. Setting the window to 0 delivers
 whatever it holds at once.
 
-**Held back, 2026-10-16.** As first built, a held DM was lost two ways, while its sender had been
+**Held back, then fixed, 2026-10-16.** As first built, a held DM was lost two ways, while its sender had been
 told it was delivered: a hub restart dropped everything held (the batch lived only in memory), and a
 recipient whose stream was down when the window closed never got the batch. A message sent to an
 absent seat without a window answers `delivered_to: 0`, so the sender knows; the window turned that
-into a silent loss. Until both are fixed, `POST /quiet` answers 501 with the reason and the hub does
-not load `quiet.json`, so nothing is held. The fix: a batch whose recipient has no stream waits for
-its next connection; holds are logged beside the wakes, so a restarted hub recovers what was held and
-never delivered, by set of ids rather than by the last id (an #all delivered after a held DM would
-otherwise mark it delivered); and held windows are flushed on a clean shutdown.
+into a silent loss. The first live hub held the window back (`POST /quiet` answered 501 and `quiet.json` was not
+loaded). The fix:
+
+- a batch whose recipient has no stream when the window closes waits for that seat's next
+  connection, and is delivered then as one wake;
+- every hold is logged in `wakes.jsonl` as `{ts, to, held: [id]}` (a hold is not a wake), so a hub
+  that was killed recovers on start what was held and never delivered: held ids minus delivered ids,
+  as sets. "Newer than the seat's last wake" would be wrong: an #all delivered after a held DM would
+  mark the DM delivered;
+- a held message older than `CHILLACKS_HELD_MAX_S` (default 1800) when its seat can be reached is
+  dropped and logged (it stays in the archive), and recovery takes nothing older;
+- SIGTERM and SIGINT flush every window before the hub exits. A forced kill runs no handler (on
+  Windows, `Stop-Process -Force` is one), so recovery from the log is what covers a restart there.
 
 That makes wakes impossible to count from the archive alone. So the hub writes one line per actual
 delivery to a recipient to `wakes.jsonl` beside the archive (`CHILLACKS_WAKES`; `{ts, to, ids}`; a
 digest is one line with every id it carried). A status, a ledger record and a message to an absent
-seat write no line. Wakes then become something the hub records rather than
+seat write no line. Holds are logged in the same file with `held` in place of `ids`; a census of wakes
+skips them. Wakes then become something the hub records rather than
 something we infer, and the census reads them directly.
 
 ## 4. Box telemetry
