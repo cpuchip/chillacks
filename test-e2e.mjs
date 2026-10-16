@@ -121,7 +121,7 @@ const tools = (await alice.listTools()).tools.map((t) => t.name).sort();
 check(
   "tools exposed",
   tools.join(",") ===
-    "chillacks_ack,chillacks_channels,chillacks_claim,chillacks_recent,chillacks_roster,chillacks_selftest,chillacks_send",
+    "chillacks_ack,chillacks_channels,chillacks_claim,chillacks_quiet,chillacks_recent,chillacks_roster,chillacks_selftest,chillacks_send",
   tools.join(","),
 );
 
@@ -178,6 +178,21 @@ const c4 = await bob.callTool({ name: "chillacks_claim", arguments: { resource: 
 check("claim tool: another refusal shows its code and route", /^REFUSED \(unknown_box\): .* ask workspace-basecamp/.test(said(c4)), said(c4));
 const c5 = await bob.callTool({ name: "chillacks_claim", arguments: { resource: ":9000" } });
 check("claim tool: a held resource still reads HELD", /^HELD by alice since /.test(said(c5)), said(c5));
+
+// status and quiet through the shim
+const bobSeen = inbox[B].length;
+const sst = await alice.callTool({ name: "chillacks_send", arguments: { text: "deploy green", status: true } });
+await settle(400);
+check("send status=true records a status", /^status recorded as alice \(msg #\d+\); delivered to nobody/.test(said(sst)), said(sst));
+check("and wakes nobody", inbox[B].length === bobSeen, `${bobSeen} -> ${inbox[B].length}`);
+const qon = await bob.callTool({ name: "chillacks_quiet", arguments: { seconds: 1 } });
+check("quiet tool sets a window", /^quiet window 1 s/.test(said(qon)), said(qon));
+const qdm = await alice.callTool({ name: "chillacks_send", arguments: { to: B, text: "held one" } });
+check("a DM into a window says it is held", /held up to 1 s by bob's quiet window/.test(said(qdm)), said(qdm));
+await settle(1400);
+check("and arrives after the window", inbox[B].some((n) => n.content === "held one"));
+const qoff = await bob.callTool({ name: "chillacks_quiet", arguments: { seconds: 0 } });
+check("quiet tool turns it off", /^quiet window off/.test(said(qoff)), said(qoff));
 
 // selftest echoes only to the sender
 const beforeSelf = inbox[A].length, bobBefore = inbox[B].length;

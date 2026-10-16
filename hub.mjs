@@ -119,6 +119,47 @@ function saveChannels() {
 }
 loadChannels();
 
+// --- quiet windows: several DMs to one seat become one wake ------------------
+// A seat that asked five others a question was woken five times in a minute by
+// the answers. A window holds a seat's DMs and acks for N seconds after the
+// first, then delivers them as one. Channels and #all are never held: they
+// carry rulings and blockers. Persisted like channels, so a restart keeps it.
+const QUIET_FILE = process.env.CHILLACKS_QUIET || path.join(ARCHIVE_DIR, "quiet.json");
+const QUIET_MAX_S = 900;
+/** name -> seconds */
+const quiet = new Map();
+/** name -> { msgs: [], timer } */
+const held = new Map();
+try {
+  if (fs.existsSync(QUIET_FILE))
+    for (const [n, sec] of Object.entries(JSON.parse(fs.readFileSync(QUIET_FILE, "utf8"))))
+      if (Number.isFinite(sec) && sec > 0 && sec <= QUIET_MAX_S) quiet.set(n, sec);
+} catch (e) {
+  console.error(`[chillacks] quiet.json unreadable (${e.message}) — starting with no windows`);
+}
+function saveQuiet() {
+  try {
+    fs.writeFileSync(QUIET_FILE, JSON.stringify(Object.fromEntries(quiet), null, 2));
+  } catch (e) {
+    console.error(`[chillacks] quiet.json write failed: ${e.message}`);
+  }
+}
+
+// --- the wake log: one line per delivery the hub actually makes -------------
+// The archive says what was sent; once a window folds five DMs into one, it can
+// no longer say how many times a seat was woken. This file can.
+const WAKES = process.env.CHILLACKS_WAKES || path.join(ARCHIVE_DIR, "wakes.jsonl");
+function logWake(to, ids) {
+  try {
+    fs.appendFileSync(WAKES, JSON.stringify({ ts: new Date().toISOString(), to, ids }) + "\n");
+  } catch (e) {
+    console.error(`[chillacks] wakes.jsonl write failed: ${e.message}`);
+  }
+}
+
+/** each seat's latest status: name -> { id, text, ts } */
+const latestStatus = new Map();
+
 // --- claims: a lease on a shared thing, so an open call can't summon six ----
 // Seven seats converged on one test file from "whoever's awake". A claim is
 // mechanics-not-memory: first claimant holds the lease, everyone else is told
@@ -210,6 +251,7 @@ function loadArchive() {
     try {
       const m = JSON.parse(line);
       if (m.from) seen.add(String(m.from));
+      if (m.kind === "status") latestStatus.set(String(m.from), { id: m.id, text: m.text, ts: m.ts });
       if (m.id > seq) seq = m.id;
       if (LEDGER_KINDS.has(m.kind)) apply(ledger, m); // replay; a refusal changes nothing
       else history.push(m);
@@ -394,10 +436,59 @@ function deliver(msg, { echo = false } = {}) {
     if (name === msg.from && !echo) continue; // normally don't echo to sender
     const set = members.get(name);
     if (!set?.size) continue; // the room archives but does not queue — absent means missed
+    if (msg.to && quiet.has(name) && !echo) {
+      hold(name, msg); // counted: it will be delivered when the window closes
+      n++;
+      continue;
+    }
     for (const m of set) m.write(msg); // every stream the name holds, one recipient
+    logWake(name, [msg.id]);
     n++;
   }
   return n; // actual deliveries, not a guess from roster size
+}
+
+function hold(name, msg) {
+  let h = held.get(name);
+  if (!h) {
+    h = { msgs: [], timer: setTimeout(() => flush(name), quiet.get(name) * 1000) };
+    held.set(name, h);
+  }
+  h.msgs.push(msg);
+}
+
+/** Deliver what a window held: the message itself when there was one, else
+ *  one digest from `chillacks` listing each by id, so each can still be acked.
+ *  The originals are already archived; the digest is a delivery, not a
+ *  message, so it is not. A seat that left during the window reads them with
+ *  chillacks_recent, as it would any message sent while it was away. */
+function flush(name) {
+  const h = held.get(name);
+  if (!h) return;
+  clearTimeout(h.timer);
+  held.delete(name);
+  const set = members.get(name);
+  if (!set?.size) return;
+  const ids = h.msgs.map((m) => m.id);
+  const out =
+    h.msgs.length === 1
+      ? h.msgs[0]
+      : {
+          id: null,
+          from: "chillacks",
+          to: name,
+          kind: "digest",
+          ids,
+          text:
+            `${h.msgs.length} messages held by your quiet window:\n` +
+            h.msgs
+              .map((m) => `#${m.id} ${m.from}${m.kind === "ack" ? ` [ack #${m.ref}]` : ""}: ${m.text}`)
+              .join("\n"),
+          ts: new Date().toISOString(),
+        };
+  for (const m of set) m.write(out);
+  logWake(name, ids);
+  console.error(`[chillacks] quiet window for ${name}: ${ids.length} message(s) as one`);
 }
 
 // --- /ws: the native-WebSocket door (2026-08-10, Michael's ruling) ----------
@@ -577,6 +668,22 @@ const server = http.createServer(async (req, res) => {
     const from = AUTH ? who : p.from;
     if (!from) return json(400, { error: "from required" });
 
+    // A status is for the record: archived, shown on the roster, and delivered
+    // to nobody. 124 FYIs woke the foreman in one week; they can be read instead.
+    if (p.kind != null && p.kind !== "status") return json(400, { error: `unknown kind ${JSON.stringify(p.kind)}` });
+    if (p.kind === "status") {
+      if (p.to || p.channel)
+        return json(400, { error: "a status is delivered to nobody; send a DM or a channel message instead" });
+      const msg = { id: ++seq, from: String(from), to: null, channel: null, kind: "status", text: String(p.text), ts: new Date().toISOString() };
+      archive(msg);
+      seen.add(msg.from);
+      history.push(msg);
+      if (history.length > HISTORY_MAX) history.shift();
+      latestStatus.set(msg.from, { id: msg.id, text: msg.text, ts: msg.ts });
+      console.error(`[chillacks] ${msg.from} status: ${msg.text.slice(0, 80)}`);
+      return json(200, { ok: true, id: msg.id, delivered_to: 0, status: true });
+    }
+
     const channel = p.to ? null : p.channel ? normChannel(p.channel) : null;
     const msg = {
       id: ++seq,
@@ -605,12 +712,36 @@ const server = http.createServer(async (req, res) => {
     console.error(
       `[chillacks] ${msg.from} -> ${msg.to || (msg.channel ? "#" + msg.channel : "#all")} [${n}]${unknown ? " UNKNOWN SEAT" : ""}: ${msg.text.slice(0, 80)}`,
     );
+    const heldFor = msg.to && n && quiet.has(msg.to) && p.echo !== true ? quiet.get(msg.to) : 0;
     return json(200, {
       ok: true,
       id: msg.id,
       delivered_to: n,
+      ...(heldFor ? { held_s: heldFor } : {}),
       ...(unknown ? { unknown: true, suggest: nearestNames(msg.to) } : {}),
     });
+  }
+
+  // --- POST /quiet : {seconds} — hold my DMs and acks, deliver them as one ---
+  if (req.method === "POST" && url.pathname === "/quiet") {
+    let p;
+    try {
+      p = JSON.parse(await readBody(req));
+    } catch {
+      return json(400, { error: "bad json" });
+    }
+    const name = AUTH ? who : p.from;
+    if (!name) return json(400, { error: "from required" });
+    const sec = p.seconds;
+    if (typeof sec !== "number" || !Number.isFinite(sec) || sec < 0 || sec > QUIET_MAX_S)
+      return json(400, { error: `seconds must be a number from 0 to ${QUIET_MAX_S}` });
+    if (sec === 0) {
+      quiet.delete(name);
+      flush(name); // what the window holds goes now
+    } else quiet.set(name, sec);
+    saveQuiet();
+    console.error(`[chillacks] ${name} quiet window ${sec ? sec + " s" : "off"}`);
+    return json(200, { ok: true, seconds: sec });
   }
 
   // --- POST /channel : {action: join|leave, channel} ------------------------
@@ -749,6 +880,10 @@ const server = http.createServer(async (req, res) => {
         ]),
       ),
       budgets: v.boxes,
+      quiet: Object.fromEntries(quiet),
+      status: Object.fromEntries(
+        [...latestStatus].map(([n, st]) => [n, { ...st, text: st.text.slice(0, 200) }]),
+      ),
     });
   }
 

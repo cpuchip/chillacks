@@ -207,8 +207,27 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               "Working-group channel. Only its members (and @mentioned agents) are woken. Ignored when to= is set.",
           },
+          status: {
+            type: "boolean",
+            description:
+              "A status for the record (deploy green, merge done): archived and shown on the roster, delivered to nobody. Takes no to or channel.",
+          },
         },
         required: ["text"],
+      },
+    },
+    {
+      name: "chillacks_quiet",
+      description:
+        "Set a quiet window: the hub holds your DMs and acks for this many seconds " +
+        "after the first one arrives, then delivers them as one wake. Channel and " +
+        "#all messages are never held. 0 turns it off and delivers anything held.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          seconds: { type: "number", description: "0 to 900" },
+        },
+        required: ["seconds"],
       },
     },
     {
@@ -297,6 +316,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
   try {
     if (name === "chillacks_send") {
+      if (args.status === true) {
+        const st = await post("/send", { from: ME, kind: "status", text: args.text });
+        return { content: [{ type: "text", text: `status recorded as ${ME} (msg #${st.id}); delivered to nobody, shown on the roster` }] };
+      }
       const out = await post("/send", {
         from: ME,
         to: args.to || null,
@@ -321,7 +344,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [
           {
             type: "text",
-            text: `sent as ${ME} -> ${dest} (${out.delivered_to} recipient(s), msg #${out.id})${warn}${pull}${unknown}`,
+            text: `sent as ${ME} -> ${dest} (${out.delivered_to} recipient(s), msg #${out.id})${out.held_s ? `, held up to ${out.held_s} s by ${args.to}'s quiet window` : ""}${warn}${pull}${unknown}`,
+          },
+        ],
+      };
+    }
+    if (name === "chillacks_quiet") {
+      const out = await post("/quiet", { from: ME, seconds: args.seconds });
+      return {
+        content: [
+          {
+            type: "text",
+            text: out.seconds
+              ? `quiet window ${out.seconds} s: your DMs and acks arrive together, at most ${out.seconds} s after the first`
+              : "quiet window off: DMs arrive as they are sent",
           },
         ],
       };

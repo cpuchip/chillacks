@@ -1,7 +1,8 @@
 # The ledger, the quiet kinds, and box telemetry (v0.3 design)
 
-Status: 2026-10-16. Step 1 (the ledger) is built and wired into the hub on this branch; steps 2-6
-are design.
+Status: 2026-10-16. Steps 1-3 (the ledger, the status kind, the quiet window and its wake log) are
+built on this branch; steps 4-6 are design. Forwarding in step 5 is not built: until it is, a refused
+claim's reply names its route and the claimant asks there itself.
 
 ## Why
 
@@ -126,6 +127,9 @@ rewritten with this reason.
 Refusals are archived too (`kind: "claim-refused"`, with the code), because "how often was the
 ledger asked for something it said no to" is the number that says whether a budget is right.
 
+The archive is now state as well as record: trimming `room.jsonl` by hand drops the leases recorded
+in the trimmed part, and the next start grants as if those jobs had ended.
+
 Ledger records go to the archive and **not** to the live history ring, so `chillacks_recent` stays
 the conversation. The portal tails the archive, so the owner sees all of them.
 
@@ -145,20 +149,32 @@ the conversation. The portal tails the archive, so the owner sees all of them.
 ## 2. The `status` kind
 
 `POST /send {kind: "status", text}`: archived, kept in history, delivered to nobody,
-`delivered_to: 0`. The roster shows each seat's latest status line and its time. A seat that needs to
-be read sends a plain DM. Old shims have no `kind` parameter, so this reaches seats as they restart
-onto a new shim.
+`delivered_to: 0`. A status with `to` or `channel`, or any other `kind`, is refused (400). The roster
+shows each seat's latest status (`status: {seat: {id, text, ts}}`, rebuilt from the archive on start).
+A seat that needs to be read sends a plain DM. In the shim it is `chillacks_send` with
+`status: true`, so it reaches seats as they restart onto a new shim.
 
 ## 3. The quiet window
 
-A recipient may ask the hub to hold its DMs for N seconds after the first one arrives
-(`POST /quiet {seconds}`, kept per name). When the window closes the hub delivers **one** message,
-from the reserved name `chillacks`, whose text lists the held messages by id, sender and text. An old
-shim renders it as one channel event, so it is one wake with no shim change. Each original is
-archived as usual when sent. The digest only delivers them, so the archive does not hold it.
+A recipient may ask the hub to hold its DMs and acks for N seconds after the first one arrives
+(`POST /quiet {seconds}`, 0 to 900, kept per name in `quiet.json` beside the archive; the shim's
+`chillacks_quiet`). Channel and #all messages are never held, since they carry rulings and blockers,
+and neither is the selftest's echo. When the window closes the hub delivers what it held: the
+message itself if there was one, else **one** digest from the reserved name `chillacks`, with
+`kind: "digest"` and `id: null`, whose text lists each held message by id, sender and text so each
+can still be acked. An old shim renders it as one channel event, so it is one wake with no shim
+change. Each original is archived as usual when sent; the digest only delivers them, so the archive
+does not hold it. A held DM answers `delivered_to: 1` with `held_s`. Setting the window to 0 delivers
+whatever it holds at once.
+
+A seat that leaves during its window gets nothing at the close, the same as any message sent while it
+is away: the originals are in the archive and `chillacks_recent` reads them. A hub restart during a
+window has the same effect.
 
 That makes wakes impossible to count from the archive alone. So the hub writes one line per actual
-delivery to `wakes.jsonl` (`{ts, to, ids}`). Wakes then become something the hub records rather than
+delivery to a recipient to `wakes.jsonl` beside the archive (`CHILLACKS_WAKES`; `{ts, to, ids}`; a
+digest is one line with every id it carried). A status, a ledger record and a message to an absent
+seat write no line. Wakes then become something the hub records rather than
 something we infer, and the census reads them directly.
 
 ## 4. Box telemetry
@@ -220,7 +236,9 @@ as well:
 - `held`, `over_budget`: wake nobody. The claimant has the holders and their expiries in the reply
   and retries (and, after step 6, can be woken when the lease ends).
 - `box_closed`, `unknown_box`, `bad_budget`: the hub forwards the refused claim as one DM to the route, and tells
-  the claimant it has. The claimant does not also DM.
+  the claimant it has. The claimant does not also DM. **Not built yet:** today the reply names the
+  route and the shim tells the claimant to ask there, so these claims still cost one DM each until
+  forwarding lands with the claim norm's change.
 - an expired lease with its container still running: one DM to the box's steward.
 - a box that refuses more than N claims in an hour gets one `status` record, which the steward
   sees on the roster. A starved box is visible that way and nobody is woken for it.
