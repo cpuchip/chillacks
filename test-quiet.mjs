@@ -233,6 +233,28 @@ await settle(600);
 check("Q1: after a hard kill and restart, the held DM reaches bob", count(B, crash.id) === 1, JSON.stringify(inbox[B].slice(-2)));
 check("Q1: and the #all is not delivered twice", count(B, allAfter.id) === 1);
 
+// T1 (threadchip #8861): a torn last line in wakes.jsonl must not swallow the
+// next line. The recovered DM's wake line would join the torn bytes, the next
+// start would not see it, and the DM would be delivered again.
+await post(B, "/quiet", { seconds: 3 });
+const t1 = await post(A, "/send", { to: B, text: "held, then the log tore" });
+await settle(200);
+ctls[B].abort();
+await restart("SIGKILL");
+fs.appendFileSync(WAKES, '{"ts":"2026-10-16T00:00:00.000Z","to":"carol","id');
+hub.kill("SIGKILL"); // restart once more so the hub starts on the torn file
+await settle(400);
+hub = startHub();
+await waitUp(hub);
+await listen(A); await listen(B); await listen(C);
+await settle(600);
+check("T1: the held DM is recovered once on the torn log", count(B, t1.id) === 1, `${count(B, t1.id)}`);
+await restart("SIGKILL");
+await listen(A); await listen(B); await listen(C);
+await settle(600);
+check("T1: and not again at the next restart", count(B, t1.id) === 1, `${count(B, t1.id)}`);
+check("T1: the torn bytes stay, on their own line", fs.readFileSync(WAKES, "utf8").split("\n").includes('{"ts":"2026-10-16T00:00:00.000Z","to":"carol","id'));
+
 // a message delivered before a restart is not delivered again after it
 await post(B, "/quiet", { seconds: 0.5 });
 const done = await post(A, "/send", { to: B, text: "delivered before the restart" });
@@ -243,19 +265,28 @@ await listen(A); await listen(B); await listen(C);
 await settle(600);
 check("not delivered again after a restart", count(B, done.id) === 1, `${count(B, done.id)}`);
 
-// a clean stop delivers what is held before the streams close
+// A clean stop delivers what is held before the streams close. On Windows
+// there is no clean stop to test: process.kill ends the process at once and no
+// handler runs (a Windows host's run, basecamp #8859), so there the same block is one
+// more hard kill, covered by recovery. CHILLACKS_TEST_PLATFORM=win32 rehearses
+// that path on another OS.
+const WIN = (process.env.CHILLACKS_TEST_PLATFORM || process.platform) === "win32";
 await post(B, "/quiet", { seconds: 5 });
-const term = await post(A, "/send", { to: B, text: "held at a clean stop" });
+const term = await post(A, "/send", { to: B, text: "held at a stop" });
 await settle(300);
-hub.kill("SIGTERM");
+hub.kill(WIN ? "SIGKILL" : "SIGTERM");
 await settle(500);
-check("SIGTERM: what was held is delivered before the hub exits", count(B, term.id) === 1, JSON.stringify(inbox[B].slice(-2)));
+if (WIN) {
+  console.log("SKIP  SIGTERM: what was held is delivered before the hub exits  — win32: a kill runs no handler; recovery below");
+  check("win32 kill: nothing reached bob before the restart", count(B, term.id) === 0, JSON.stringify(inbox[B].slice(-2)));
+} else check("SIGTERM: what was held is delivered before the hub exits", count(B, term.id) === 1, JSON.stringify(inbox[B].slice(-2)));
 hub = startHub();
 await waitUp(hub);
 for (const s of streams) s.abort();
 await listen(A); await listen(B); await listen(C);
 await settle(600);
-check("SIGTERM: and not again after the restart", count(B, term.id) === 1, `${count(B, term.id)}`);
+check(WIN ? "win32 kill: delivered once, after the restart (recovery)" : "SIGTERM: and not again after the restart",
+  count(B, term.id) === 1, `${count(B, term.id)}`);
 
 // a batch older than the age limit is dropped at reconnect, not delivered stale
 await restart("SIGTERM", { CHILLACKS_HELD_MAX_S: "2" });
@@ -274,9 +305,10 @@ await listen(B);
 await settle(500);
 check("age limit: a batch past the limit is not delivered at reconnect", count(B, old.id) === 0);
 check("age limit: and the hub says it dropped it", /dropped 1 held message/.test(hub.log), hub.log.split("\n").filter((l) => /held/.test(l)).slice(-2).join(" | "));
-await restart("SIGTERM");
+await restart("SIGTERM"); // back to the default age limit
 await listen(A); await listen(B); await listen(C);
-await settle(300);
+await settle(600);
+check("age limit: a dropped message is not revived by the next restart", count(B, old.id) === 0, `${count(B, old.id)}`);
 await post(B, "/quiet", { seconds: 0 });
 
 // ── restart: windows and statuses come back ────────────────────────────────

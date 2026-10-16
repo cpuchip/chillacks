@@ -198,7 +198,15 @@ loaded). The fix:
 - a held message older than `CHILLACKS_HELD_MAX_S` (default 1800) when its seat can be reached is
   dropped and logged (it stays in the archive), and recovery takes nothing older;
 - SIGTERM and SIGINT flush every window before the hub exits. A forced kill runs no handler (on
-  Windows, `Stop-Process -Force` is one), so recovery from the log is what covers a restart there.
+  Windows every stop is one: `process.kill` and `Stop-Process -Force` end the process at once), so
+  recovery from the log is what covers a restart there;
+- `wakes.jsonl` is state now, so a torn last line is ended on load before anything is appended, as
+  in `room.jsonl`; otherwise the first line written after a crash would join the torn bytes and be
+  lost, and a recovered message would be delivered again at the next start.
+
+Recovery is at-least-once. If a wake line fails to write after a live delivery (a full disk, a
+scanner's lock), the next start delivers that message again. A repeat carries its original `msg_id`,
+so a seat can see it has read it before.
 
 That makes wakes impossible to count from the archive alone. So the hub writes one line per actual
 delivery to a recipient to `wakes.jsonl` beside the archive (`CHILLACKS_WAKES`; `{ts, to, ids}`; a

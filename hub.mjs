@@ -151,11 +151,12 @@ function saveQuiet() {
 // The archive says what was sent; once a window folds five DMs into one, it can
 // no longer say how many times a seat was woken. This file can.
 const WAKES = process.env.CHILLACKS_WAKES || path.join(ARCHIVE_DIR, "wakes.jsonl");
-/** A hold is logged beside the wakes (a line with `held`, not `ids`), so a
- *  restarted hub can deliver what was held and never delivered. */
-function logHold(to, id) {
+/** Holds and drops are logged beside the wakes (lines with `held` or
+ *  `dropped`, never `ids`), so a restarted hub delivers what was held and
+ *  neither delivered nor dropped. Only a line with `ids` is a wake. */
+function logHeld(to, field, ids) {
   try {
-    fs.appendFileSync(WAKES, JSON.stringify({ ts: new Date().toISOString(), to, held: [id] }) + "\n");
+    fs.appendFileSync(WAKES, JSON.stringify({ ts: new Date().toISOString(), to, [field]: ids }) + "\n");
   } catch (e) {
     console.error(`[chillacks] wakes.jsonl write failed: ${e.message}`);
   }
@@ -260,16 +261,21 @@ function nearestNames(target) {
 // --- archive: append-only, never rewritten -------------------------------
 fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 
+/** A crash mid-append leaves a last line with no newline, and the next append
+ *  would join it: both would then be skipped as one bad line. In room.jsonl
+ *  that loses a grant; in wakes.jsonl a delivery, so a recovered DM is sent
+ *  again. End the torn line first; its bytes stay, on a line of their own. */
+function endTornLine(file, raw) {
+  if (raw.length && !raw.endsWith("\n")) {
+    fs.appendFileSync(file, "\n");
+    console.error(`[chillacks] ${path.basename(file)}: last line had no newline (a torn write) — ended it before appending`);
+  }
+}
+
 function loadArchive() {
   if (!fs.existsSync(ARCHIVE)) return 0;
   const raw = fs.readFileSync(ARCHIVE, "utf8");
-  // A crash mid-append leaves a last line with no newline, and the next append
-  // would join it: both would then be skipped as one bad line, and a grant with
-  // them. End the torn line first; its bytes stay, on a line of their own.
-  if (raw.length && !raw.endsWith("\n")) {
-    fs.appendFileSync(ARCHIVE, "\n");
-    console.error(`[chillacks] archive: last line had no newline (a torn write) — ended it before appending`);
-  }
+  endTornLine(ARCHIVE, raw);
   const lines = raw.split("\n").filter(Boolean);
   let bad = 0;
   for (const line of lines) {
@@ -319,14 +325,16 @@ recoverHeld();
  *  an #all delivered after a held DM must not mark the DM delivered. */
 function recoverHeld() {
   if (!fs.existsSync(WAKES)) return;
+  const raw = fs.readFileSync(WAKES, "utf8");
+  endTornLine(WAKES, raw);
   const heldIds = new Map(), done = new Map();
-  for (const line of fs.readFileSync(WAKES, "utf8").split("\n")) {
+  for (const line of raw.split("\n")) {
     let w;
     try { w = JSON.parse(line); } catch { continue; }
     if (!w?.to) continue;
     const into = w.held ? heldIds : done;
     if (!into.has(w.to)) into.set(w.to, new Set());
-    for (const id of w.held || w.ids || []) into.get(w.to).add(id);
+    for (const id of w.held || w.ids || w.dropped || []) into.get(w.to).add(id); // a drop is settled too
   }
   for (const [name, ids] of heldIds) {
     const msgs = [...ids]
@@ -523,7 +531,7 @@ function hold(name, msg) {
     held.set(name, h);
   }
   h.msgs.push(msg);
-  logHold(name, msg.id);
+  logHeld(name, "held", [msg.id]);
 }
 
 /** Deliver what a window held: the message itself when there was one, else
@@ -546,6 +554,7 @@ function flush(name) {
   held.delete(name);
   const cutoff = Date.now() - HELD_MAX_S * 1000;
   const fresh = h.msgs.filter((m) => Date.parse(m.ts) >= cutoff);
+  if (fresh.length < h.msgs.length) logHeld(name, "dropped", h.msgs.filter((m) => !fresh.includes(m)).map((m) => m.id));
   if (fresh.length < h.msgs.length)
     console.error(
       `[chillacks] ${name}: dropped ${h.msgs.length - fresh.length} held message(s) older than ${HELD_MAX_S} s; they are in the archive`,
