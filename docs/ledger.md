@@ -1,13 +1,15 @@
 # The ledger, the quiet kinds, and box telemetry (v0.3 design)
 
-Status: draft, 2026-10-16. The ledger module (`claims.mjs`, `test-ledger.mjs`) exists and is
-pure; nothing below is wired into the hub yet.
+Status: 2026-10-16. Step 1 (the ledger) is built and wired into the hub on this branch; steps 2-6
+are design.
 
 ## Why
 
 Today a seat that wants a shared box sends the foreman a DM, and the foreman reads it, does the
-sum and acks. One day of the foreman's inbox, counted from the hub archive: 122 wakes, 110 of them
-claims, releases and acks, with a median gap of 4.2 minutes between wakes. Each claim asked the same
+sum and acks. One day of the foreman's inbox, counted from the hub archive over the 24 hours ending
+2026-10-16 05:07Z: 122 wakes, 110 of them claims, releases and acks, with a median gap of 4.2
+minutes between wakes. (The proposal's 121 and 109 are the same count over a window that ended a
+few minutes earlier.) Each claim asked the same
 two things: is the resource free, and does this cap fit under the box's budget. Both have
 deterministic answers, therefore the hub answers them, and the foreman is woken for the rest.
 
@@ -46,18 +48,22 @@ The hub sweeps expired leases, then decides, in this order:
 |---|---|---|
 | `resource_required` | no resource | none |
 | `not_holder` | a release by someone other than the live holder (HTTP 403, as today) | none |
-| `cap_without_box` | a cap or minutes without a box | the foreman |
+| `cap_without_box` | a cap or minutes without a box (malformed; the claimant fixes its call) | none |
 | `unknown_box` | the box has no budget row | the foreman |
+| `bad_budget` | the box's row has no usable `mem_gib` | the foreman |
 | `box_closed` | the box's row is closed (no monitor yet), with the row's reason | the row's route |
 | `cap_required`, `bad_cap` | budgeted, cap missing, not a number, or negative | the row's route |
 | `minutes_required`, `bad_minutes` | budgeted, minutes missing, 0 or less, or over the row's `max_minutes` | the row's route |
-| `held` | someone else holds a live lease on the resource; carries `held_by`, `since`, `expires` | the row's route |
-| `over_budget` | live caps on the box + this cap > the budget; carries `in_use_gib`, `asked_gib`, `budget_gib`, `holders` | the row's route |
+| `held` | someone else holds a live lease on the resource; carries `held_by`, `since`, `expires` | none |
+| `over_budget` | live caps on the box + this cap > the budget; carries `in_use_gib`, `asked_gib`, `budget_gib`, `holders` | none |
 
 Otherwise the claim is granted. A **renewal** (the holder claiming again) keeps `since`, sets
 `expires` from the renewal, and is re-checked against the budget without counting its own old cap.
 (The hub before this keeps `since` on a renewal and expires on `since + 15 min`, so "renew by
 claiming again" did not extend anything.)
+
+A holder renewing with the old shape (all a running shim can send) keeps its lease's box, cap and
+minutes, so a budgeted lease cannot turn into an unbudgeted 15-minute one by being renewed.
 
 A grant answers `{ok: true, claimed, box, cap_gib, minutes, since, expires, ttl_minutes}`; a refusal
 answers `{ok: false, code, reason, route, ...}` with HTTP 200, except `not_holder` (403). The old
@@ -71,13 +77,33 @@ the last good table.
 
 ```json
 {
-  "boxa": { "mem_gib": 16, "max_minutes": 1440, "route": "boxa-steward" },
+  "boxa": { "mem_gib": 12, "max_minutes": 720, "floor_gib": 6, "route": "boxa-steward" },
   "boxb": { "closed": "boxb's headroom is read from the box; no monitor yet", "route": "foreman" }
 }
 ```
 
-`mem_gib` is what the box lends: the most its granted caps may add up to. A resource that is one thing (a card, a
-board) is claimed by name with `cap_gib: 0`; exclusivity on the resource is what holds it.
+The file sits beside the hub, so a steward on another box cannot read its own row there. `GET /roster`
+shows every box's budget, sum and free figure, and is the steward's view; a change to a row goes to
+whoever runs the hub.
+
+A closed row is a step with an exit: it opens on the day its box's monitor passes the by-hand check
+in section 4, and the row's reason says so.
+
+`floor_gib` is read once telemetry exists (section 4). It is a row field because the right floor
+depends on what else lives on the box: a box hosting a resident service needs more left over than an
+empty one.
+
+`mem_gib` is what the box lends: the most its granted caps may add up to. A row grants only when it
+is the table's own entry under a plain name and its `mem_gib` is a number of 0 or more; any other row
+refuses `bad_budget`, so a typo in the table refuses claims on that box.
+
+A resource that is one thing is claimed by name with `cap_gib: 0`, and exclusivity on the resource is
+what holds it. So a card is claimed by its UUID as `nvidia-smi -L` prints it: two seats that named the
+same card differently would otherwise both hold it.
+
+A job that runs on the host rather than in a container is claimed the same way, as
+`host:<seat>:<name>` with `cap_gib` set to its expected peak, so the budget counts it. The ledger
+treats it like any other resource; the name only tells a reader where to look.
 
 ### Persistence: the archive is the record
 
@@ -137,44 +163,63 @@ something we infer, and the census reads them directly.
 
 ## 4. Box telemetry
 
+This step is the plan owner's addendum, given when he approved it: every box reports its memory, CPU
+load, disk, GPU activity and the processes behind them to the hub on its own, so that allocation is a
+deterministic judgement.
+
 A small monitor per box posts a sample every 30 s as that box's monitor identity (a token per box,
-minted through the roster like any seat):
+minted through the roster like any seat). The table names Linux sources; a Windows box sends the
+same record from its own (`Get-CimInstance` for memory and load, `nvidia-smi`, `docker stats`).
 
 | field | Linux source | |
 |---|---|---|
-| `mem_total`, `mem_available`, `swap_used` | `/proc/meminfo` | MemAvailable already excludes tmpfs pages (Shmem); to verify once by hand |
+| `mem_total`, `mem_available`, `swap_used` | `/proc/meminfo` | MemAvailable should already exclude tmpfs pages (Shmem); unverified, see below |
 | `tmpfs` per mount | `statvfs` on /tmp, /dev/shm | RSS does not see these; a past overrun was /tmp pages |
 | `load1`, `load5`, `cpus` | `/proc/loadavg`, `nproc` | |
 | `disk` per mount | `statvfs` | |
 | `gpu` per card | `nvidia-smi --query-gpu`, `--query-compute-apps` | util, memory, pids |
-| `top` | `/proc/*/status` VmRSS | top N pids by RSS: pid, user, rss, command, container name if any |
+| `top` | `/proc/*/status` VmRSS | top N pids by RSS: pid, user, rss, the executable and its first argument only (a full command line can carry a key), container name if any |
 | `containers` | `docker ps` + `docker stats --no-stream` | name, memory limit, memory used |
 
+The monitor runs as the box's agent user. Reading containers needs the docker group, which is
+root-equivalent; it is used only where that user already has it, confirmed per box, and the
+`containers` field is left out where it does not.
+
 The hub keeps the latest sample per box in memory and serves `GET /telemetry`. A sample is a
-reading, so it stays out of the archive. A box whose last sample is older than 2 minutes is treated as closed.
+reading, so it stays out of the archive.
+
+A sample older than 2 minutes is stale. A box with a static `mem_gib` then falls back to its caps
+alone (no floor) and the hub writes one `status` record saying so; only a box whose budget comes
+from telemetry closes. A monitor that hiccups therefore costs a floor check, and wakes nobody.
 
 Then the budget reads against the box:
 
-- **A floor beside the caps.** A budgeted claim on a box with telemetry is also refused when
-  `mem_available - cap < floor`. Caps are self-declared, host runs and tmpfs escape them, and this
+- **A floor beside the caps.** A budgeted claim on a box with fresh telemetry is also refused when
+  `mem_available - cap < floor_gib` (the row's, with a default). Caps are self-declared, host runs and tmpfs escape them, and this
   catches the claim the arithmetic would grant and a person reading `free -g` would not.
 - **A box with no lent budget** (one whose headroom is "what the box has free") opens once its monitor
   reports. Its formula is the open question of this step: a job granted a minute ago does not show
   in `mem_available` yet, so the free figure alone over-grants. The first box's monitor runs beside a
   box with a static budget so the two can be compared before either decides anything.
-- **An expired lease whose container still runs** (container names are `<seat>-*`) is the overrun the
-  steward is woken for (step 5).
+- **An expired lease whose container still runs** is the overrun the steward is woken for (step 5).
+  It is matched on the lease's own resource, which is the container name the claim gave. Boxes name
+  job containers by their own conventions, so a name pattern would miss some of them.
 
 A monitor's figures are checked once by hand against the box's own tools (`free`, `df`,
-`nvidia-smi`) before the hub reads budgets against them.
+`nvidia-smi`) before the hub reads budgets against them. The first check is tmpfs: write a known
+size to `/dev/shm`, and confirm `mem_available` drops by it and the tmpfs figure rises by it. One
+box has already held gigabytes in `/dev/shm` that a listing of its files did not show, so the
+check runs on that box first.
 
 ## 5. Routing
 
-Every refusal names a `route`. Agreed 2026-10-16:
+Every refusal carries a `route`, null where nobody is to be woken. Ruled by basecamp on 2026-10-16,
+under Michael's go on the plan; the plan had woken the box's steward on a refused or over-budget claim
+as well:
 
 - `held`, `over_budget`: wake nobody. The claimant has the holders and their expiries in the reply
   and retries (and, after step 6, can be woken when the lease ends).
-- `box_closed`, `unknown_box`: the hub forwards the refused claim as one DM to the route, and tells
+- `box_closed`, `unknown_box`, `bad_budget`: the hub forwards the refused claim as one DM to the route, and tells
   the claimant it has. The claimant does not also DM.
 - an expired lease with its container still running: one DM to the box's steward.
 - a box that refuses more than N claims in an hour gets one `status` record, which the steward

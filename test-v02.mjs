@@ -171,8 +171,12 @@ hub = startHub();
 for (let i = 0; i < 25 && !/chillacks hub/.test(hub.log); i++) await settle(150);
 const chans = await (await fetch(`${HUB}/channels`, { headers: hdr(A) })).json();
 check("channels survive a hub restart", Array.isArray(chans.channels?.forge) && chans.channels.forge.includes(A) && chans.channels.forge.includes(B));
+// Claims were ephemeral by design until 2026-10-16, when a claim could start
+// carrying a memory cap against a box's budget: a restart that forgot a running
+// job would grant past the budget. Grants are archived and replayed now, so the
+// lease bob took above is still his.
 const claimsAfter = await (await fetch(`${HUB}/roster`, { headers: hdr(A) })).json();
-check("claims are ephemeral by design", !claimsAfter.claims || Object.keys(claimsAfter.claims).length === 0);
+check("claims survive a hub restart", claimsAfter.claims?.[":8080"]?.by === B, JSON.stringify(claimsAfter.claims));
 
 // ── leave dissolves an empty group ────────────────────────────────────────
 await post(A, "/channel", { action: "leave", channel: "forge" });

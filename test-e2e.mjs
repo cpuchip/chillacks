@@ -50,6 +50,8 @@ const ARCHIVE = path.join(DIR, "room.jsonl");
 const A = "alice", B = "bob";
 const TOK = { [A]: "e2e-token-alice-aaaaaaaaaaaa", [B]: "e2e-token-bob-bbbbbbbbbbbbbb" };
 fs.writeFileSync(TOKENS_FILE, JSON.stringify(TOK));
+// read by the hub from beside the archive (CHILLACKS_BUDGETS unset)
+fs.writeFileSync(path.join(DIR, "budgets.json"), JSON.stringify({ boxa: { mem_gib: 10, route: "boxa-steward" } }));
 
 const inbox = { [A]: [], [B]: [], lurker: [] };
 let fails = 0;
@@ -161,6 +163,21 @@ check("a forged `from` is overridden by the token",
 // roster tool
 const rt = await bob.callTool({ name: "chillacks_roster", arguments: {} });
 check("roster tool sees both", rt.content[0].text.includes(A) && rt.content[0].text.includes(B), rt.content[0].text);
+
+// claim tool: the old shape, then a budgeted claim granted and one refused,
+// through the shim exactly as a session calls it
+const said = (r) => r.content[0].text;
+const c1 = await alice.callTool({ name: "chillacks_claim", arguments: { resource: ":9000" } });
+check("claim tool: old shape still a 15-minute lease", /^CLAIMED :9000 .*15-minute lease/.test(said(c1)), said(c1));
+const c2 = await alice.callTool({ name: "chillacks_claim", arguments: { resource: "alice-job", box: "boxa", cap_gib: 6, minutes: 30 } });
+check("claim tool: a budgeted claim passes box, cap and minutes", /^CLAIMED alice-job .*30-minute lease.* on boxa, 6 GiB/.test(said(c2)), said(c2));
+const c3 = await bob.callTool({ name: "chillacks_claim", arguments: { resource: "bob-job", box: "boxa", cap_gib: 6, minutes: 30 } });
+check("claim tool: a full box names the holder and the end of its lease",
+  /^REFUSED: boxa: 6 GiB in use \+ 6 asked > 10 GiB budget\. Holding now: alice-job \(alice, 6 GiB, until /.test(said(c3)), said(c3));
+const c4 = await bob.callTool({ name: "chillacks_claim", arguments: { resource: "bob-job", box: "boxz", cap_gib: 1, minutes: 5 } });
+check("claim tool: another refusal shows its code and route", /^REFUSED \(unknown_box\): .* ask workspace-basecamp/.test(said(c4)), said(c4));
+const c5 = await bob.callTool({ name: "chillacks_claim", arguments: { resource: ":9000" } });
+check("claim tool: a held resource still reads HELD", /^HELD by alice since /.test(said(c5)), said(c5));
 
 // selftest echoes only to the sender
 const beforeSelf = inbox[A].length, bobBefore = inbox[B].length;

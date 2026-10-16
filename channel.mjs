@@ -263,14 +263,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chillacks_claim",
       description:
-        "Take a 15-minute lease on a shared resource (a file, a port, a seam) " +
-        "before touching it. Returns who holds it on conflict. release=true frees " +
-        "your own claim. Renew by claiming again.",
+        "Take a lease on a shared resource (a file, a port, a card, a container) " +
+        "before touching it. With only `resource` it is a 15-minute lease. With " +
+        "`box`, `cap_gib` and `minutes` it also counts your job's memory cap against " +
+        "that box's budget, and the hub grants or refuses on the spot. On a " +
+        "refusal you get the reason, and for a full box the " +
+        "holders and when each lease ends. release=true frees your own claim. Renew " +
+        "by claiming again; the lease then runs from the renewal.",
       inputSchema: {
         type: "object",
         properties: {
-          resource: { type: "string", description: "What you are claiming, e.g. ':8080' or 'internal/server/endtoend_test.go'" },
+          resource: { type: "string", description: "What you are claiming, e.g. ':8080', a container name like '<seat>-build', or 'host:<seat>:<name>' for a job outside a container" },
           release: { type: "boolean", description: "Release your claim instead of taking one" },
+          box: { type: "string", description: "The box whose budget this counts against (needs cap_gib and minutes)" },
+          cap_gib: { type: "number", description: "The job's memory cap in GiB (its expected peak for a host job); 0 for a card or board" },
+          minutes: { type: "number", description: "Expected minutes; the lease ends then unless renewed" },
         },
         required: ["resource"],
       },
@@ -404,6 +411,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         from: ME,
         resource: args.resource,
         release: args.release === true,
+        ...(args.box != null ? { box: args.box } : {}),
+        ...(args.cap_gib != null ? { cap_gib: args.cap_gib } : {}),
+        ...(args.minutes != null ? { minutes: args.minutes } : {}),
       });
       if (out.released)
         return { content: [{ type: "text", text: `released ${out.released}` }] };
@@ -412,7 +422,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text",
-              text: `CLAIMED ${out.claimed} — ${out.ttl_minutes}-minute lease; release when done`,
+              text:
+                `CLAIMED ${out.claimed} — ${out.ttl_minutes}-minute lease until ${out.expires}` +
+                (out.box ? ` on ${out.box}, ${out.cap_gib} GiB` : "") +
+                "; release when done",
+            },
+          ],
+        };
+      if (out.code === "over_budget") {
+        const who = (out.holders || []).map((h) => `${h.resource} (${h.by}, ${h.cap_gib} GiB, until ${h.expires})`).join("; ");
+        return {
+          content: [
+            { type: "text", text: `REFUSED: ${out.reason}. Holding now: ${who}. Wait for a lease to end or ask for less, then claim again.` },
+          ],
+        };
+      }
+      if (out.code && out.code !== "held")
+        return {
+          content: [
+            {
+              type: "text",
+              text: `REFUSED (${out.code}): ${out.reason}` + (out.route ? ` — ask ${out.route}` : ""),
             },
           ],
         };

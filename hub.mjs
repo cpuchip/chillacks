@@ -21,6 +21,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { URL } from "node:url";
+import { newLedger, decide, apply, sweep, view } from "./claims.mjs";
 
 const HOST = process.env.CHILLACKS_HOST || "127.0.0.1";
 const PORT = Number(process.env.CHILLACKS_PORT || 8790);
@@ -120,16 +121,40 @@ loadChannels();
 
 // --- claims: a lease on a shared thing, so an open call can't summon six ----
 // Seven seats converged on one test file from "whoever's awake". A claim is
-// mechanics-not-memory: first claimant holds a 15-minute lease, everyone else
-// is told who has it. Ephemeral BY DESIGN — a hub restart clears the locks,
-// which is also the recovery path for a wedged one.
-/** resource -> { by, since } */
-const claims = new Map();
-const CLAIM_TTL_MS = 15 * 60_000;
-function sweepClaims() {
-  const now = Date.now();
-  for (const [r, c] of claims) if (now - c.since > CLAIM_TTL_MS) claims.delete(r);
+// mechanics-not-memory: first claimant holds the lease, everyone else is told
+// who has it. A claim may also name a box, a cap and minutes, and then the
+// sum of caps on the box stays under the box's budget (claims.mjs, and
+// docs/ledger.md for the design).
+//
+// Claims were ephemeral until 2026-10-16: a restart cleared them. A budget
+// cannot work that way (a restart would forget a running job and grant past
+// it), so grants and releases are archived and replayed on start.
+const FOREMAN = process.env.CHILLACKS_FOREMAN || "workspace-basecamp";
+const ledger = newLedger({}, { foreman: FOREMAN });
+/** archive kinds that are records, not messages: never delivered, never in history */
+const LEDGER_KINDS = new Set(["claim", "release", "claim-refused"]);
+
+// The budget table is a household's rulings, so it lives beside the archive,
+// not in the repo. Reloaded on change; an unreadable file keeps the last good
+// table, so a half-written edit cannot open every box.
+const BUDGETS_FILE = process.env.CHILLACKS_BUDGETS || path.join(ARCHIVE_DIR, "budgets.json");
+function loadBudgets() {
+  if (!fs.existsSync(BUDGETS_FILE)) return false;
+  try {
+    const raw = JSON.parse(fs.readFileSync(BUDGETS_FILE, "utf8"));
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("not an object");
+    ledger.budgets = raw;
+    console.error(`[chillacks] budgets: ${Object.keys(raw).join(", ") || "(none)"}`);
+    // an unusable row refuses every claim on its box; say so now, not at the first claim
+    for (const [box, v] of Object.entries(view(ledger, Date.now()).boxes))
+      if (v.invalid) console.error(`[chillacks] ! budget row ${box} is unusable (${v.invalid}) — claims on it are refused`);
+    return true;
+  } catch (e) {
+    console.error(`[chillacks] ! budgets.json unreadable (${e.message}) — KEEPING the previous table`);
+    return false;
+  }
 }
+loadBudgets();
 
 const normChannel = (s) => String(s || "").toLowerCase().replace(/^#/, "").trim();
 
@@ -184,9 +209,10 @@ function loadArchive() {
   for (const line of lines) {
     try {
       const m = JSON.parse(line);
-      history.push(m);
       if (m.from) seen.add(String(m.from));
       if (m.id > seq) seq = m.id;
+      if (LEDGER_KINDS.has(m.kind)) apply(ledger, m); // replay; a refusal changes nothing
+      else history.push(m);
     } catch {
       bad++; // a torn final write survives as one skipped line, not a dead hub
     }
@@ -207,6 +233,21 @@ function archive(msg) {
 }
 
 const restored = loadArchive();
+sweep(ledger, Date.now());
+
+/** Archive a ledger record. It is the record of a grant, a release or a
+ *  refusal, so it gets an id like any message, and it is delivered to nobody
+ *  and kept out of history: a seat catching up reads the conversation. */
+function ledgerRecord(fields) {
+  const msg = { id: ++seq, to: null, channel: null, ...fields, ts: new Date().toISOString() };
+  archive(msg);
+  seen.add(msg.from);
+  return msg;
+}
+
+function claimText(r) {
+  return r.box ? `claim ${r.resource} on ${r.box}, ${r.cap_gib} GiB, ${r.minutes} min` : `claim ${r.resource} (${r.minutes} min)`;
+}
 
 // --- identity -------------------------------------------------------------
 // Names used to be self-asserted. That was tolerable while peers only traded
@@ -284,6 +325,16 @@ try {
   });
 } catch (e) {
   console.error(`[chillacks] could not watch ${ARCHIVE_DIR} (${e.message}) — tokens need a restart`);
+}
+let budgetTimer = null;
+try {
+  fs.watch(path.dirname(BUDGETS_FILE), (_evt, file) => {
+    if (file !== path.basename(BUDGETS_FILE)) return;
+    clearTimeout(budgetTimer);
+    budgetTimer = setTimeout(loadBudgets, 150);
+  });
+} catch (e) {
+  console.error(`[chillacks] could not watch ${path.dirname(BUDGETS_FILE)} (${e.message}) — budgets need a restart`);
 }
 
 /** When identity turns on mid-flight, streams opened while the room was open
@@ -631,26 +682,47 @@ const server = http.createServer(async (req, res) => {
     }
     const from = AUTH ? who : p.from;
     if (!from) return json(400, { error: "from required" });
-    const r = String(p.resource || "").trim();
-    if (!r) return json(400, { error: "resource required" });
-    sweepClaims();
-    const held = claims.get(r);
-    if (p.release) {
-      if (held && held.by !== from)
-        return json(403, { ok: false, error: `held by ${held.by}, not you` });
-      claims.delete(r);
-      console.error(`[chillacks] ${from} released ${r}`);
-      return json(200, { ok: true, released: r });
-    }
-    if (held && held.by !== from)
-      return json(200, {
-        ok: false,
-        held_by: held.by,
-        since: new Date(held.since).toISOString(),
+    const now = Date.now();
+    sweep(ledger, now);
+    const d = decide(
+      ledger,
+      { from, resource: p.resource, release: p.release === true, box: p.box, cap_gib: p.cap_gib, minutes: p.minutes },
+      now,
+    );
+    if (!d.ok && d.code === "resource_required") return json(400, { error: d.reason });
+    if (!d.ok) {
+      ledgerRecord({
+        from,
+        kind: "claim-refused",
+        code: d.code,
+        resource: String(p.resource),
+        ...(p.box != null ? { box: String(p.box) } : {}),
+        route: d.route,
+        text: `claim ${p.resource} refused: ${d.reason}`,
       });
-    claims.set(r, { by: from, since: held ? held.since : Date.now() });
-    console.error(`[chillacks] ${from} claimed ${r}`);
-    return json(200, { ok: true, claimed: r, ttl_minutes: CLAIM_TTL_MS / 60_000 });
+      console.error(`[chillacks] ${from} refused ${p.resource} (${d.code}): ${d.reason}`);
+      // a non-holder release stays a 403, as the old shim expects
+      return json(d.code === "not_holder" ? 403 : 200, { ...d, error: d.reason });
+    }
+    const r = d.record;
+    if (r.kind === "release") {
+      apply(ledger, ledgerRecord({ from, kind: "release", resource: r.resource, text: `release ${r.resource}` }));
+      console.error(`[chillacks] ${from} released ${r.resource}`);
+      return json(200, { ok: true, released: r.resource });
+    }
+    const { at: _at, ...fields } = r;
+    apply(ledger, ledgerRecord({ ...fields, text: claimText(r) }));
+    console.error(`[chillacks] ${from} ${claimText(r)}`);
+    return json(200, {
+      ok: true,
+      claimed: r.resource,
+      box: r.box,
+      cap_gib: r.cap_gib,
+      minutes: r.minutes,
+      since: r.since,
+      expires: r.expires,
+      ttl_minutes: r.minutes,
+    });
   }
 
   // --- GET /channels --------------------------------------------------------
@@ -662,15 +734,21 @@ const server = http.createServer(async (req, res) => {
 
   // --- GET /roster ---------------------------------------------------------
   if (req.method === "GET" && url.pathname === "/roster") {
-    sweepClaims();
+    const now = Date.now();
+    sweep(ledger, now);
+    const v = view(ledger, now);
     return json(200, {
       members: [...members.keys()],
       count: members.size,
       messages: history.length,
       channels: Object.fromEntries([...channels].map(([c, s]) => [c, [...s]])),
       claims: Object.fromEntries(
-        [...claims].map(([r, c]) => [r, { by: c.by, since: new Date(c.since).toISOString() }]),
+        Object.entries(v.leases).map(([r, l]) => [
+          r,
+          { by: l.by, since: l.since, box: l.box, cap_gib: l.cap_gib, expires: l.expires },
+        ]),
       ),
+      budgets: v.boxes,
     });
   }
 

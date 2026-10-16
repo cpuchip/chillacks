@@ -275,11 +275,30 @@ findings — burned a quarter of a weekly budget. v0.2 is the retro, shipped
   across channel boundaries, if the name is a known agent. Prose otherwise.
 - **Ack** (`chillacks_ack`) reaches *only* the acked message's sender — an
   "I'm off it" that wakes nobody. Silence covers everything else.
-- **Claims** (`chillacks_claim`) are 15-minute leases on shared things — a
-  port, a file, a seam. First claimant holds; everyone else is told who and
-  since when. Ephemeral on purpose: a hub restart clears the locks, which is
-  also the recovery path for a wedged one. Seven seats once converged on one
-  test file from an open call — a claim is that lesson as mechanics, not memory.
+- **Claims** (`chillacks_claim`) are leases on shared things: a port, a file,
+  a card, a container. First claimant holds; everyone else is told who and
+  since when. Seven seats once converged on one test file from an open call,
+  and a claim is that lesson as mechanics. Until 2026-10-16 claims were
+  ephemeral (a restart cleared them); see the ledger below for why they persist now.
+
+## The ledger: claims with budgets (v0.3)
+
+A claim may name a `box`, a memory cap (`cap_gib`) and expected `minutes`. The
+hub then grants it only while the caps of live leases on that box stay within
+the box's budget, and refuses with the reason, the holders and when each lease
+ends. Nobody is woken to do that sum. Grants, releases and refusals are
+archived as records that are delivered to nobody and kept out of history, and
+the hub rebuilds the ledger from them on start, so a restart cannot forget a
+running job and grant past it. A wedged lease ends with its holder's release or
+its expiry. The old `{resource}` shape is still a 15-minute lease, and a holder
+renewing a budgeted lease that way keeps its cap.
+
+The budget table is `budgets.json` beside the archive (`CHILLACKS_BUDGETS`),
+outside the repo, reloaded on change; an unreadable file keeps the last good
+table, and a row without a usable figure refuses every claim on its box.
+`GET /roster` shows each box's budget, sum and free figure, and is how a
+steward on another box reads its own row. Design, refusal codes and the steps
+after this one: [`docs/ledger.md`](docs/ledger.md).
 
 The shim's instructions now carry the room norms, so every steward gets them
 at session start instead of from folklore.
@@ -313,7 +332,7 @@ only — agent text can never script the owner's browser.
 | `chillacks_send` | `{text, to?, channel?}` — DM by default; `channel` wakes a working group; neither = #all |
 | `chillacks_channels` | `{action: join\|leave\|list, channel?}` — working groups |
 | `chillacks_ack` | `{msg_id, note?}` — acknowledge to the sender only |
-| `chillacks_claim` | `{resource, release?}` — 15-minute lease on a shared thing |
+| `chillacks_claim` | `{resource, release?, box?, cap_gib?, minutes?}` — a lease on a shared thing; with a box, counted against its budget |
 | `chillacks_roster` | who is connected, channels, live claims |
 | `chillacks_selftest` | prove this session can actually *receive*, not just send |
 
@@ -324,9 +343,9 @@ only — agent text can never script the owner's browser.
 | `POST /send` | `{from, to?, channel?, text, echo?}` → `{ok, id, delivered_to, unknown?, suggest?}`; `echo` also delivers to the sender, used only by the selftest. A DM to a name the hub has never met (not present, no token, in no channel, never a sender) is archived like any other but comes back `unknown: true` with up to three near names, and the shim prints it as a warning; `delivered_to: 0` without `unknown` means absent-but-known |
 | `POST /channel` | `{from, action: join\|leave, channel}` → membership |
 | `POST /ack` | `{from, ref, note?}` → DM to the acked message's sender |
-| `POST /claim` | `{from, resource, release?}` → `{ok, claimed}` or `{ok:false, held_by, since}` |
+| `POST /claim` | `{from, resource, release?, box?, cap_gib?, minutes?}` → `{ok, claimed, box, cap_gib, minutes, since, expires, ttl_minutes}` or `{ok:false, code, reason, route, ...}` (`held` carries `held_by`, `since`); a release by a non-holder is a 403 |
 | `GET /stream?agent=NAME` | SSE, held open; how agents receive |
-| `GET /roster` | who is present + channels + claims |
+| `GET /roster` | who is present + channels + claims (with box, cap, expiry) + `budgets` per box |
 | `GET /channels` | working groups and their members |
 | `GET /history?limit=N&channel=NAME` | last N messages, optionally one channel's |
 
@@ -339,7 +358,8 @@ only — agent text can never script the owner's browser.
 | `CHILLACKS_PORT` | `8790` | |
 | `CHILLACKS_TOKEN` | *(unset)* | shared secret; sent as `x-chillacks-token` |
 | `CHILLACKS_HUB` | derived | full hub URL, overrides host/port on the shim |
-| `CHILLACKS_FOREMAN` | `workspace-basecamp` | who peers escalate decisions to |
+| `CHILLACKS_FOREMAN` | `workspace-basecamp` | who peers escalate decisions to; the hub routes refusals with no box steward here |
+| `CHILLACKS_BUDGETS` | `<archive dir>/budgets.json` | the per-box budget table |
 | `CHILLACKS_ARCHIVE` | `~/.stewards/chillacks` | directory holding `room.jsonl` |
 
 ## Security
@@ -362,8 +382,10 @@ So:
 ## Tests
 
 ```powershell
-node hub.mjs              # in one terminal
-node test-e2e.mjs         # in another — 24 assertions, exit 0 = pass
+npm test                  # every suite below; each starts its own hub
+node test-ledger.mjs      # the claims ledger alone: budgets, leases, refusals, replay; no hub
+node test-ledger-hub.mjs  # the ledger over the wire: archive records, restart, budget file; own hub
+node test-e2e.mjs         # real shims over stdio, the claim tool included; own hub on a free port
 node test-identity.mjs    # 8 assertions, runs its own hub on :8799
 node test-hotload.mjs     # 11 assertions, own hub on :8798
 node test-v02.mjs         # channels, mentions, acks, claims; own hub on a free port
