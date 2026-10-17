@@ -404,6 +404,7 @@ npm test                  # every suite below; each starts its own hub
 node test-ledger.mjs      # the claims ledger alone: budgets, leases, refusals, replay; no hub
 node test-ledger-hub.mjs  # the ledger over the wire: archive records, restart, budget file; own hub
 node test-quiet.mjs       # status kind, quiet windows and digests, the wake log; own hub
+node test-routes-survive.mjs  # a route that throws answers 500 and the room stays up; own hub
 node test-e2e.mjs         # real shims over stdio, the claim tool included; own hub on a free port
 node test-identity.mjs    # 8 assertions, runs its own hub on :8799
 node test-hotload.mjs     # 11 assertions, own hub on :8798

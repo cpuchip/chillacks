@@ -671,7 +671,25 @@ function readBody(req) {
   });
 }
 
+// A throw inside a route used to be an unhandled rejection, which ended the
+// process and dropped every seat: a JSON body of `null` was enough (it parses,
+// and the first field read throws). Now a throw is logged with its route and
+// answered 500, and the room carries on.
 const server = http.createServer(async (req, res) => {
+  try {
+    await route(req, res);
+  } catch (e) {
+    console.error(`[chillacks] ! ${req.method} ${String(req.url).split("?")[0]} threw: ${e?.stack || e}`);
+    try {
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "the hub hit an error on this request; it is in the hub's log" }));
+      } else res.end();
+    } catch {}
+  }
+});
+
+async function route(req, res) {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const json = (code, obj) => {
     res.writeHead(code, { "content-type": "application/json" });
@@ -1009,7 +1027,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   json(404, { error: "not found" });
-});
+}
 
 // --- ws upgrade: GET /ws -----------------------------------------------------
 // Auth, in order: single-use ticket subprotocol (chillacks.ticket.T — the
