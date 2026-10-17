@@ -257,10 +257,17 @@ exactly the amount written; deleting the file gave it back. The same writes to d
 cannot: the floor check below sees it. The same box held 8 GiB in `/dev/shm` at the time, a
 production service's deleted mmap; the sample reports it on the tmpfs line and in `mem.shmem`.
 
-**Command lines.** `top` carries the executable's base name and its first argument only. A first
-argument that is a flag keeps its name and drops anything after `=`; one that looks like a secret
-(the words key, token, secret or password, or a long unbroken run of base64) is replaced by
-`<redacted>`. A sample is a reading: it is never archived.
+**Command lines.** `top` carries the executable's name (from `comm`, cut at a space: a process that
+rewrites its title, as postgres does with user, database and client, leaves it whole there) and its
+first argument only, and only while argv is still argv. A first argument that is a flag keeps its
+name and drops anything after `=`; one with whitespace is `<text>` (a seat launched with its first
+prompt as argv[1] carries the whole brief there) and one past 120 characters is `<long>`.
+Credentials in a URL lose their userinfo (`postgres://<redacted>@db/x`). An argument is `<redacted>`
+when it names a secret (key, token, secret, password), starts with a credential prefix (`gh?_`,
+`github_pat_`, `sk-`, `xox?-`, `AKIA`, `glpat-`, `hf_`, `AIza`), is a JWT, or has the shape of one (a
+long run mixing digits and both cases, or a long hex run). What it cannot catch, by construction: a
+short plain password passed as a bare argument, which differs from an ordinary word in nothing; the
+cure is not to pass secrets as arguments. A sample is a reading: it is never archived.
 
 ### The record
 

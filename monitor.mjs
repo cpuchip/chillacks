@@ -42,9 +42,18 @@ export function redactArg(a) {
   if (s.startsWith("-")) return s.split("=")[0];
   if (/\s/.test(s)) return "<text>";
   if (s.length > 120) return "<long>";
+  // credentials in a URL (scheme://user:pass@host): the URL stays, the userinfo goes
+  const userinfo = s.match(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]+@/i);
+  if (userinfo) return userinfo[1] + "<redacted>@" + s.slice(userinfo[0].length);
   if (/key|token|secret|passw/i.test(s)) return "<redacted>";
-  // credentials that announce themselves by prefix (GitHub, OpenAI and Anthropic style, Slack, AWS, GitLab)
-  if (/^(gh[pousr]_|github_pat_|sk-|xox[abpr]-|AKIA|glpat-)/.test(s)) return "<redacted>";
+  // credentials that announce themselves by prefix (GitHub, OpenAI and Anthropic style, Slack, AWS,
+  // GitLab, Hugging Face, Google API keys)
+  if (/^(gh[pousr]_|github_pat_|sk-|xox[abpr]-|AKIA|glpat-|hf_|AIza)/.test(s)) return "<redacted>";
+  // a JWT: base64url header starting eyJ, then a dotted payload
+  if (/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(s)) return "<redacted>";
+  // Not caught, by construction: a short plain password passed as a bare argument
+  // (one that has no flag, no secret word and no token shape). Nothing about it
+  // differs from an ordinary word; the cure is not to pass secrets as arguments.
   for (const run of s.match(/[A-Za-z0-9_+=-]{24,}/g) || [])
     if (/\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run)) return "<redacted>";
   if (/[0-9a-fA-F]{32,}/.test(s)) return "<redacted>";
