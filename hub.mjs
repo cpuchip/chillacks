@@ -1124,9 +1124,6 @@ function upgradeRoute(req, socket, head) {
 
   const ping = setInterval(() => { try { socket.write(WS_PING); } catch {} }, 25_000);
   const state = { buf: Buffer.alloc(0) };
-  // bytes that arrived with the handshake come as `head`, not as socket data:
-  // parse them first, or the frames after them are read from the wrong offset
-  if (head?.length && wsConsume(state, head, socket)) return end();
   socket.on("data", (chunk) => { if (wsConsume(state, chunk, socket)) end(); });
   const bye = () => {
     clearInterval(ping);
@@ -1134,6 +1131,12 @@ function upgradeRoute(req, socket, head) {
   };
   socket.on("close", bye);
   socket.on("error", bye);
+  // Bytes that arrived with the handshake come as `head`, not as socket data:
+  // parse them before any later frame, or those are read from the wrong offset.
+  // Only now, with close and error attached: a close here must run bye() like
+  // any other, or the seat stays on the roster with a dead socket (a ghost that
+  // DMs count as delivered to) and its ping is never cleared.
+  if (head?.length && wsConsume(state, head, socket)) end();
 }
 
 // A clean stop delivers what windows hold before the streams close. A forced
