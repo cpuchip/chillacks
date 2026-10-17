@@ -38,10 +38,15 @@ for (const [arg, want] of [
   ["--max-old-space-size=100", "--max-old-space-size"],
   ["--api-key=hunter2", "--api-key"],
   ["--token", "--token"],
-  ["sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", "<redacted>"],
+  // token fixtures are synthetic on purpose (one repeated character, or built at
+  // run time), so no secret scanner has to decide whether a test holds a credential
+  ["sk-" + "x".repeat(40), "<redacted>"],
+  ["Ab1".repeat(10), "<redacted>"],
   ["password123", "<redacted>"],
   ["my_secret.txt", "<redacted>"],
-  ["ghp_x7Kq2mZ9vR4tLb8NwP3sYc6HfJ1dGe5UaQo0", "<redacted>"],
+  ["ghp_" + "x".repeat(36), "<redacted>"],
+  ["github_pat_" + "x".repeat(70), "<redacted>"],
+  ["AKIA" + "X".repeat(16), "<redacted>"],
   ["deadbeefdeadbeefdeadbeefdeadbeef0123", "<redacted>"],
   ["/home/dev/code/some-long-project-workspace-name/projects/app/channel.mjs", "/home/dev/code/some-long-project-workspace-name/projects/app/channel.mjs"],
   ["/srv/app/main.py", "/srv/app/main.py"],

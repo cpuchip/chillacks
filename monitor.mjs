@@ -40,6 +40,8 @@ export function redactArg(a) {
   if (/\s/.test(s)) return "<text>";
   if (s.length > 120) return "<long>";
   if (/key|token|secret|passw/i.test(s)) return "<redacted>";
+  // credentials that announce themselves by prefix (GitHub, OpenAI and Anthropic style, Slack, AWS, GitLab)
+  if (/^(gh[pousr]_|github_pat_|sk-|xox[abpr]-|AKIA|glpat-)/.test(s)) return "<redacted>";
   for (const run of s.match(/[A-Za-z0-9_+=-]{24,}/g) || [])
     if (/\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run)) return "<redacted>";
   if (/[0-9a-fA-F]{32,}/.test(s)) return "<redacted>";
