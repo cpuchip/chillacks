@@ -205,6 +205,37 @@ function claim(L, from, req, now = T0) {
   check("no refusal above left a lease", Object.keys(v.leases).length === 0);
 }
 
+// ── the floor: a box's own reading beside its caps (docs/ledger.md section 4) ─
+{
+  const FB = { boxa: { mem_gib: 16, floor_gib: 8, route: "boxa-steward" }, boxc: { mem_gib: 16, route: "s" } };
+  const L = newLedger(FB, { foreman: FOREMAN, staleS: 120 });
+  L.readings.set("boxa", { available_gib: 20, at: T0 });
+  const a = claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 10, minutes: 60 }, T0 + 1000);
+  check("floor: a claim that leaves the floor is granted (20 - 10 >= 8)", a.ok === true, JSON.stringify(a));
+  const b = claim(L, "bob", { resource: "bob-job", box: "boxa", cap_gib: 4, minutes: 60 }, T0 + 2000);
+  check("floor: caps granted since the reading count against it (20 - 10 - 4 < 8)", b.ok === false && b.code === "below_floor", JSON.stringify(b));
+  check("floor: the refusal wakes nobody and shows its sum", b.route === null && b.available_gib === 20 && b.granted_since_gib === 10 && b.floor_gib === 8, JSON.stringify(b));
+  check("floor: the caps alone would have granted it (10 + 4 <= 16)", view(L, T0 + 2000).boxes.boxa.in_use_gib === 10);
+  L.readings.set("boxa", { available_gib: 11, at: T0 + 30_000 }); // alice's job has allocated
+  const c = claim(L, "bob", { resource: "bob-job", box: "boxa", cap_gib: 3, minutes: 60 }, T0 + 31_000);
+  check("floor: a new reading counts what has allocated, not the old grants again (11 - 3 >= 8)", c.ok === true, JSON.stringify(c));
+  L.readings.set("boxa", { available_gib: 9, at: T0 + 60_000 });
+  const ren = claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 10, minutes: 60 }, T0 + 61_000);
+  check("floor: renewing a job the reading already holds does not count its cap again", ren.ok === true, JSON.stringify(ren));
+  const grow = claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 12, minutes: 60 }, T0 + 62_000);
+  check("floor: a renewal that grows counts only the growth (9 - 2 < 8)", grow.ok === false && grow.code === "below_floor", JSON.stringify(grow));
+  const stale = claim(L, "carol", { resource: "carol-job", box: "boxa", cap_gib: 2, minutes: 5 }, T0 + 60_000 + 121_000);
+  check("floor: a stale reading leaves the caps alone in force (13 + 2 <= 16)", stale.ok === true, JSON.stringify(stale));
+  L.readings.set("boxc", { available_gib: 1, at: T0 });
+  const nofloor = claim(L, "dave", { resource: "dave-job", box: "boxc", cap_gib: 4, minutes: 5 }, T0 + 1000);
+  check("floor: a row with no floor_gib ignores the reading", nofloor.ok === true, JSON.stringify(nofloor));
+  const none = newLedger(FB, { foreman: FOREMAN });
+  check("floor: a box with no reading at all is caps alone", claim(none, "erin", { resource: "e", box: "boxa", cap_gib: 15, minutes: 5 }, T0).ok === true);
+  const bad = newLedger({ boxx: { mem_gib: 16, floor_gib: "8" } }, { foreman: FOREMAN });
+  const bf = claim(bad, "probe", { resource: "p", box: "boxx", cap_gib: 1, minutes: 5 }, T0);
+  check("floor: a floor_gib that is not a number makes the row unusable", bf.ok === false && bf.code === "bad_budget", JSON.stringify(bf));
+}
+
 // ── replay: the ledger rebuilt from its own records is the same ledger ──────
 {
   const L = newLedger(BUDGETS, { foreman: FOREMAN });

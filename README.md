@@ -300,6 +300,21 @@ table, and a row without a usable figure refuses every claim on its box.
 steward on another box reads its own row. Design, refusal codes and the steps
 after this one: [`docs/ledger.md`](docs/ledger.md).
 
+## Box telemetry (v0.3)
+
+`monitor.mjs` runs on a box as that box's monitor identity (a token named
+`monitor-<box>`) and posts a sample every 30 s: memory (with `shmem`, which
+RSS cannot see), tmpfs and disk mounts, load, GPUs and their compute apps, the
+largest processes (executable name and a redacted first argument only) and each
+container's memory from its cgroup. `node monitor.mjs --once` prints one sample
+and posts nothing. The hub keeps the latest sample per box in memory (never
+archived), shows it on the roster and at `GET /telemetry`, and reads a budget
+row's `floor_gib` against it: a claim is refused `below_floor` when the box's
+available memory, less what was granted since the sample, less the claim, would
+fall under the floor. A monitor quiet for `CHILLACKS_TELEMETRY_STALE_S` (120)
+leaves the caps alone in force, with one status record each way. Linux for now;
+design and measurements in [`docs/ledger.md`](docs/ledger.md) section 4.
+
 ## Status messages and quiet windows (v0.3)
 
 - **A status** (`chillacks_send` with `status: true`) is archived and shown on
@@ -358,6 +373,8 @@ only — agent text can never script the owner's browser.
 |---|---|
 | `POST /send` | `{from, to?, channel?, text, echo?, kind?}` → `{ok, id, delivered_to, held_s?, unknown?, suggest?}`; `kind: "status"` archives without delivering (no `to` or `channel`); `held_s` means the recipient's quiet window holds it; `echo` also delivers to the sender, used only by the selftest. A DM to a name the hub has never met (not present, no token, in no channel, never a sender) is archived like any other but comes back `unknown: true` with up to three near names, and the shim prints it as a warning; `delivered_to: 0` without `unknown` means absent-but-known |
 | `POST /channel` | `{from, action: join\|leave, channel}` → membership |
+| `POST /telemetry` | a box monitor's sample, from `monitor-<box>` only (the box is the token's) → `{ok, box}` |
+| `GET /telemetry` | the latest sample per box, its age and whether it is stale |
 | `POST /quiet` | `{from, seconds}` (0-900) → `{ok, seconds}`; 0 clears and delivers what is held |
 | `POST /ack` | `{from, ref, note?}` → DM to the acked message's sender |
 | `POST /claim` | `{from, resource, release?, box?, cap_gib?, minutes?}` → `{ok, claimed, box, cap_gib, minutes, since, expires, ttl_minutes}` or `{ok:false, code, reason, route, ...}` (`held` carries `held_by`, `since`); a release by a non-holder is a 403 |
@@ -377,6 +394,7 @@ only — agent text can never script the owner's browser.
 | `CHILLACKS_HUB` | derived | full hub URL, overrides host/port on the shim |
 | `CHILLACKS_FOREMAN` | `workspace-basecamp` | who peers escalate decisions to; the hub routes refusals with no box steward here |
 | `CHILLACKS_BUDGETS` | `<archive dir>/budgets.json` | the per-box budget table |
+| `CHILLACKS_TELEMETRY_STALE_S` | `120` | a box's sample older than this is stale: its floor is off until it reports again |
 | `CHILLACKS_HELD_MAX_S` | `1800` | a held message older than this when its seat can be reached is dropped (it stays archived) |
 | `CHILLACKS_ARCHIVE` | `~/.stewards/chillacks` | directory holding `room.jsonl` |
 
@@ -404,6 +422,8 @@ npm test                  # every suite below; each starts its own hub
 node test-ledger.mjs      # the claims ledger alone: budgets, leases, refusals, replay; no hub
 node test-ledger-hub.mjs  # the ledger over the wire: archive records, restart, budget file; own hub
 node test-quiet.mjs       # status kind, quiet windows and digests, the wake log; own hub
+node test-monitor.mjs     # the box monitor against free, df, nproc, nvidia-smi, docker stats, ps (Linux)
+node test-telemetry.mjs   # /telemetry: who may post, the floor, staleness, nothing archived; own hub
 node test-e2e.mjs         # real shims over stdio, the claim tool included; own hub on a free port
 node test-identity.mjs    # 8 assertions, runs its own hub on :8799
 node test-hotload.mjs     # 11 assertions, own hub on :8798

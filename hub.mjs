@@ -33,6 +33,8 @@ const TOKEN = process.env.CHILLACKS_TOKEN || "";
 const ARCHIVE_DIR =
   process.env.CHILLACKS_ARCHIVE || path.join(os.homedir(), ".stewards", "chillacks");
 const ARCHIVE = path.join(ARCHIVE_DIR, "room.jsonl");
+// A box's latest monitor sample older than this is stale, and its floor is off.
+const TELE_STALE_S = Number(process.env.CHILLACKS_TELEMETRY_STALE_S || 120);
 
 // Every log line carries a UTC stamp. Without one an eviction storm cannot be
 // dated after the fact: one log held 118 reconnect lines and no way to say
@@ -178,6 +180,27 @@ function logWake(to, ids) {
 /** each seat's latest status: name -> { id, text, ts } */
 const latestStatus = new Map();
 
+/** A status from the hub itself: archived, on the roster, delivered to nobody. */
+function hubStatus(text) {
+  const msg = { id: ++seq, from: "chillacks", to: null, channel: null, kind: "status", text, ts: new Date().toISOString() };
+  archive(msg);
+  history.push(msg);
+  if (history.length > HISTORY_MAX) history.shift();
+  latestStatus.set(msg.from, { id: msg.id, text: msg.text, ts: msg.ts });
+  console.error(`[chillacks] status: ${text}`);
+}
+
+// A monitor that goes quiet: one status record each way, nobody woken, and the
+// box's claims fall back to its caps alone (claims.mjs ignores a stale reading).
+setInterval(() => {
+  const now = Date.now();
+  for (const [box, t] of telemetry)
+    if (!t.stale && now - t.at > TELE_STALE_S * 1000) {
+      t.stale = true;
+      hubStatus(`monitor-${box} stale: no sample for ${Math.round((now - t.at) / 1000)} s; ${box}'s claims fall back to its caps alone`);
+    }
+}, Math.max(250, Math.min(15_000, TELE_STALE_S * 250))).unref();
+
 // --- claims: a lease on a shared thing, so an open call can't summon six ----
 // Seven seats converged on one test file from "whoever's awake". A claim is
 // mechanics-not-memory: first claimant holds the lease, everyone else is told
@@ -189,7 +212,9 @@ const latestStatus = new Map();
 // cannot work that way (a restart would forget a running job and grant past
 // it), so grants and releases are archived and replayed on start.
 const FOREMAN = process.env.CHILLACKS_FOREMAN || "workspace-basecamp";
-const ledger = newLedger({}, { foreman: FOREMAN });
+const ledger = newLedger({}, { foreman: FOREMAN, staleS: TELE_STALE_S });
+/** box -> { at, sample, stale }: the latest monitor sample, kept in memory only */
+const telemetry = new Map();
 /** archive kinds that are records, not messages: never delivered, never in history */
 const LEDGER_KINDS = new Set(["claim", "release", "claim-refused"]);
 
@@ -962,6 +987,40 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // --- POST /telemetry : a box monitor's sample ------------------------------
+  // Only an identity named monitor-<box> may post, and the box is read from that
+  // name: a seat cannot report another box's memory.
+  if (req.method === "POST" && url.pathname === "/telemetry") {
+    let p;
+    try {
+      p = JSON.parse(await readBody(req));
+    } catch {
+      return json(400, { error: "bad json" });
+    }
+    const name = AUTH ? who : p?.from;
+    const box = String(name || "").match(/^monitor-([a-z0-9][a-z0-9_.-]*)$/i)?.[1];
+    if (!box) return json(403, { error: "telemetry is posted by a box's monitor identity, monitor-<box>" });
+    if (!p || typeof p !== "object" || Array.isArray(p) || p.v !== 1 || !p.mem || !Number.isFinite(p.mem.available_gib))
+      return json(400, { error: "a sample is {v: 1, mem: {available_gib: <number>, ...}, ...}" });
+    const now = Date.now();
+    const was = telemetry.get(box);
+    telemetry.set(box, { at: now, sample: { ...p, box }, stale: false });
+    ledger.readings.set(box, { available_gib: p.mem.available_gib, at: now });
+    if (was?.stale) hubStatus(`monitor-${box} reporting again; ${box}'s floor is back in force`);
+    return json(200, { ok: true, box });
+  }
+
+  // --- GET /telemetry ----------------------------------------------------------
+  if (req.method === "GET" && url.pathname === "/telemetry") {
+    const now = Date.now();
+    return json(200, {
+      stale_after_s: TELE_STALE_S,
+      boxes: Object.fromEntries(
+        [...telemetry].map(([box, t]) => [box, { age_s: Math.round((now - t.at) / 1000), stale: t.stale, sample: t.sample }]),
+      ),
+    });
+  }
+
   // --- GET /channels --------------------------------------------------------
   if (req.method === "GET" && url.pathname === "/channels") {
     return json(200, {
@@ -987,6 +1046,12 @@ const server = http.createServer(async (req, res) => {
       ),
       budgets: v.boxes,
       quiet: Object.fromEntries(quiet),
+      telemetry: Object.fromEntries(
+        [...telemetry].map(([box, t]) => [
+          box,
+          { age_s: Math.round((now - t.at) / 1000), stale: t.stale, available_gib: t.sample.mem.available_gib, load1: t.sample.load?.load1 ?? null },
+        ]),
+      ),
       status: Object.fromEntries(
         [...latestStatus].map(([n, st]) => [n, { ...st, text: st.text.slice(0, 200) }]),
       ),

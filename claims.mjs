@@ -20,8 +20,10 @@
  */
 
 export const OLD_SHAPE_MINUTES = 15;
-export function newLedger(budgets, { foreman = null } = {}) {
-  return { budgets: budgets || {}, foreman, leases: new Map() };
+/** `readings` is box -> { available_gib, at }: the latest sample from the box's
+ *  own monitor, put there by the hub. A reading older than `staleS` is ignored. */
+export function newLedger(budgets, { foreman = null, staleS = 120 } = {}) {
+  return { budgets: budgets || {}, foreman, leases: new Map(), readings: new Map(), staleMs: staleS * 1000 };
 }
 
 const iso = (ms) => new Date(ms).toISOString();
@@ -59,6 +61,8 @@ function rowProblem(row) {
   if (row.closed) return null;
   if (!Number.isFinite(row.mem_gib) || row.mem_gib < 0)
     return `mem_gib must be a number of GiB, 0 or more (got ${JSON.stringify(row.mem_gib)})`;
+  if (row.floor_gib != null && !(Number.isFinite(row.floor_gib) && row.floor_gib >= 0))
+    return `floor_gib must be a number of GiB, 0 or more (got ${JSON.stringify(row.floor_gib)})`;
   return null;
 }
 
@@ -126,6 +130,25 @@ export function decide(L, req, now) {
         budget_gib: budget,
         holders: use.holders,
       });
+    // The floor: the box's own reading, less what was granted after it (a job
+    // granted a minute ago may not have allocated yet), less what this claim
+    // adds. A renewal of a job the reading already holds adds only its growth.
+    const row = rowFor(L, box);
+    const rd = row.floor_gib != null ? L.readings.get(box) : null;
+    if (rd && now - rd.at <= L.staleMs) {
+      let since = 0;
+      for (const [r, l] of L.leases)
+        if (l.box === box && r !== resource && live(l, now) && l.cap_gib != null && Date.parse(l.since) > rd.at) since += l.cap_gib;
+      const own =
+        heldLive && heldLive.by === from && Date.parse(heldLive.since) <= rd.at ? Math.max(0, cap - (heldLive.cap_gib ?? 0)) : cap;
+      if (rd.available_gib - since - own < row.floor_gib)
+        return refuse(
+          "below_floor",
+          `${box}: ${rd.available_gib} GiB available at its last reading, less ${since} granted since, less ${own} asked, is under its ${row.floor_gib} GiB floor`,
+          null,
+          { box, available_gib: rd.available_gib, granted_since_gib: since, asked_gib: own, floor_gib: row.floor_gib },
+        );
+    }
   }
 
   const since = heldLive ? heldLive.since : iso(now); // a renewal keeps when it began

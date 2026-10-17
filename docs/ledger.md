@@ -1,7 +1,8 @@
 # The ledger, the quiet kinds, and box telemetry (v0.3 design)
 
 Status: 2026-10-16. Steps 1-3 (the ledger, the status kind, the quiet window and its wake log) are
-built on this branch; steps 4-6 are design. The quiet window was held back for the first window
+built; step 4 (box telemetry and the floor) is built for Linux boxes on `hubwright/telemetry`; steps 5-6
+are design. The quiet window was held back for the first window
 (`POST /quiet` answered 501) until held messages survived a hub restart and a recipient's dropped
 stream; that fix is the end of section 3. Forwarding in step 5 is not built: until it is, a refused
 claim's reply names its route and the claimant asks there itself.
