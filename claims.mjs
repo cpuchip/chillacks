@@ -24,8 +24,9 @@ export const OLD_SHAPE_MINUTES = 15;
  *  own monitor, put there by the hub. A reading older than `staleS` is ignored. */
 export function newLedger(budgets, { foreman = null, staleS = 120 } = {}) {
   // `order` numbers every grant and every reading as it happens. "Granted since the
-  // reading" is a higher number, never a later clock: two events can share a clock
-  // value (a Windows clock steps coarsely), and a clock can step backwards.
+  // reading" is a higher number, never a later clock: two events can share one
+  // millisecond (a reading and the next grant did, on a Windows host whose clock
+  // steps 1 ms, measured), and a clock can step backwards.
   return { budgets: budgets || {}, foreman, leases: new Map(), readings: new Map(), staleMs: staleS * 1000, order: 0 };
 }
 

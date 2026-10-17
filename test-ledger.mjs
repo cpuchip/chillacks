@@ -237,9 +237,12 @@ function claim(L, from, req, now = T0) {
 }
 
 // ── order, not the clock: a grant in the same millisecond as a reading is after it ─
-// A Windows host's clock can step coarsely enough that a reading and the next
-// grant share one Date.now(); compared by time, the grant looked included in the
-// reading and its cap went uncounted (a Windows host's flake, basecamp #9147).
+// A reading and the next grant can share one Date.now(); compared by time, the
+// grant looked included in the reading and its cap went uncounted (a Windows
+// host's flake, basecamp #9147). First written as "its clock steps coarsely":
+// measured there, the clock steps 1 ms (#9149), so the tie is within one
+// millisecond and what makes it common on that host is not known. Ordering by a
+// counter removes the question.
 {
   const FB = { boxa: { mem_gib: 16, floor_gib: 8, route: "s" } };
   const L = newLedger(FB, { foreman: FOREMAN });
