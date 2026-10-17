@@ -13,7 +13,7 @@
  * Time is passed in, never read: a lease that expires is a test case, not a
  * fifteen-minute wait.
  */
-import { newLedger, decide, apply, sweep, view, replay } from "./claims.mjs";
+import { newLedger, decide, apply, sweep, view, replay, noteReading } from "./claims.mjs";
 
 let fails = 0;
 const check = (label, ok, detail = "") => {
@@ -209,24 +209,24 @@ function claim(L, from, req, now = T0) {
 {
   const FB = { boxa: { mem_gib: 16, floor_gib: 8, route: "boxa-steward" }, boxc: { mem_gib: 16, route: "s" } };
   const L = newLedger(FB, { foreman: FOREMAN, staleS: 120 });
-  L.readings.set("boxa", { available_gib: 20, at: T0 });
+  noteReading(L, "boxa", { available_gib: 20, at: T0 });
   const a = claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 10, minutes: 60 }, T0 + 1000);
   check("floor: a claim that leaves the floor is granted (20 - 10 >= 8)", a.ok === true, JSON.stringify(a));
   const b = claim(L, "bob", { resource: "bob-job", box: "boxa", cap_gib: 4, minutes: 60 }, T0 + 2000);
   check("floor: caps granted since the reading count against it (20 - 10 - 4 < 8)", b.ok === false && b.code === "below_floor", JSON.stringify(b));
   check("floor: the refusal wakes nobody and shows its sum", b.route === null && b.available_gib === 20 && b.granted_since_gib === 10 && b.floor_gib === 8, JSON.stringify(b));
   check("floor: the caps alone would have granted it (10 + 4 <= 16)", view(L, T0 + 2000).boxes.boxa.in_use_gib === 10);
-  L.readings.set("boxa", { available_gib: 11, at: T0 + 30_000 }); // alice's job has allocated
+  noteReading(L, "boxa", { available_gib: 11, at: T0 + 30_000 }); // alice's job has allocated
   const c = claim(L, "bob", { resource: "bob-job", box: "boxa", cap_gib: 3, minutes: 60 }, T0 + 31_000);
   check("floor: a new reading counts what has allocated, not the old grants again (11 - 3 >= 8)", c.ok === true, JSON.stringify(c));
-  L.readings.set("boxa", { available_gib: 9, at: T0 + 60_000 });
+  noteReading(L, "boxa", { available_gib: 9, at: T0 + 60_000 });
   const ren = claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 10, minutes: 60 }, T0 + 61_000);
   check("floor: renewing a job the reading already holds does not count its cap again", ren.ok === true, JSON.stringify(ren));
   const grow = claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 12, minutes: 60 }, T0 + 62_000);
   check("floor: a renewal that grows counts only the growth (9 - 2 < 8)", grow.ok === false && grow.code === "below_floor", JSON.stringify(grow));
   const stale = claim(L, "carol", { resource: "carol-job", box: "boxa", cap_gib: 2, minutes: 5 }, T0 + 60_000 + 121_000);
   check("floor: a stale reading leaves the caps alone in force (13 + 2 <= 16)", stale.ok === true, JSON.stringify(stale));
-  L.readings.set("boxc", { available_gib: 1, at: T0 });
+  noteReading(L, "boxc", { available_gib: 1, at: T0 });
   const nofloor = claim(L, "dave", { resource: "dave-job", box: "boxc", cap_gib: 4, minutes: 5 }, T0 + 1000);
   check("floor: a row with no floor_gib ignores the reading", nofloor.ok === true, JSON.stringify(nofloor));
   const none = newLedger(FB, { foreman: FOREMAN });
@@ -236,23 +236,48 @@ function claim(L, from, req, now = T0) {
   check("floor: a floor_gib that is not a number makes the row unusable", bf.ok === false && bf.code === "bad_budget", JSON.stringify(bf));
 }
 
+// ── order, not the clock: a grant in the same millisecond as a reading is after it ─
+// A Windows host's clock can step coarsely enough that a reading and the next
+// grant share one Date.now(); compared by time, the grant looked included in the
+// reading and its cap went uncounted (a Windows host's flake, basecamp #9147).
+{
+  const FB = { boxa: { mem_gib: 16, floor_gib: 8, route: "s" } };
+  const L = newLedger(FB, { foreman: FOREMAN });
+  noteReading(L, "boxa", { available_gib: 20, at: T0 });
+  const a = claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 10, minutes: 60 }, T0);
+  const b = claim(L, "bob", { resource: "bob-job", box: "boxa", cap_gib: 4, minutes: 60 }, T0);
+  check("tie: a grant in the reading's own millisecond counts as after it", a.ok === true && b.ok === false && b.code === "below_floor" && b.granted_since_gib === 10, JSON.stringify(b));
+  noteReading(L, "boxa", { available_gib: 11, at: T0 }); // a newer reading, same millisecond again
+  const c = claim(L, "bob", { resource: "bob-job", box: "boxa", cap_gib: 3, minutes: 60 }, T0);
+  check("tie: a newer reading in the same millisecond still supersedes the grants before it", c.ok === true, JSON.stringify(c));
+}
+{
+  // a renewal keeps its first grant's place: the reading already holds the job
+  const L = newLedger({ boxa: { mem_gib: 16, floor_gib: 8, route: "s" } }, { foreman: FOREMAN });
+  claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 10, minutes: 60 }, T0);
+  noteReading(L, "boxa", { available_gib: 20, at: T0 + 1000 });
+  claim(L, "alice", { resource: "alice-job", box: "boxa", cap_gib: 10, minutes: 60 }, T0 + 2000); // renewal
+  const b = claim(L, "bob", { resource: "bob-job", box: "boxa", cap_gib: 4, minutes: 60 }, T0 + 3000);
+  check("a renewed job is not counted as granted since the reading (20 - 4 >= 8)", b.ok === true, JSON.stringify(b));
+}
+
 // ── a reserve: what the floor adds while a named service is absent (the box steward's rule) ─
 // A reading taken while production is stopped (its card lent) sees production's
 // memory as free; lending it would put production's restore on top of the loan.
 {
   const RB = { boxa: { mem_gib: 40, floor_gib: 8, reserve: [{ absent: "prod", gib: 12 }], route: "s" } };
   const L = newLedger(RB, { foreman: FOREMAN });
-  L.readings.set("boxa", { available_gib: 30, at: T0, present: new Set(["prod", "db"]) });
+  noteReading(L, "boxa", { available_gib: 30, at: T0, present: new Set(["prod", "db"]) });
   const a = claim(L, "alice", { resource: "a", box: "boxa", cap_gib: 20, minutes: 5 }, T0 + 1000);
   check("reserve: with prod present the floor is 8 (30 - 20 >= 8)", a.ok === true, JSON.stringify(a));
   claim(L, "alice", { resource: "a", release: true }, T0 + 2000);
-  L.readings.set("boxa", { available_gib: 30, at: T0 + 3000, present: new Set(["db"]) });
+  noteReading(L, "boxa", { available_gib: 30, at: T0 + 3000, present: new Set(["db"]) });
   const b = claim(L, "bob", { resource: "b", box: "boxa", cap_gib: 12, minutes: 5 }, T0 + 4000);
   check("reserve: with prod absent the floor is 8 + 12 (30 - 12 < 20)", b.ok === false && b.code === "below_floor" && b.floor_gib === 20 && b.reserve_gib === 12, JSON.stringify(b));
   check("reserve: the refusal names what is absent", /prod/.test(b.reason ?? ""), b.reason);
   const c = claim(L, "bob", { resource: "b", box: "boxa", cap_gib: 10, minutes: 5 }, T0 + 5000);
   check("reserve: a claim that leaves the raised floor is granted (30 - 10 >= 20)", c.ok === true, JSON.stringify(c));
-  L.readings.set("boxa", { available_gib: 30, at: T0 + 6000 }); // a sample with no container list
+  noteReading(L, "boxa", { available_gib: 30, at: T0 + 6000 }); // a sample with no container list
   // bob's 10 GiB was granted before this reading, so the reading already holds it
   const d = claim(L, "carol", { resource: "c", box: "boxa", cap_gib: 11, minutes: 5 }, T0 + 7000);
   check("reserve: a reading that cannot say what is healthy applies the reserve (30 - 11 < 20)", d.ok === false && d.code === "below_floor" && d.reserve_gib === 12, JSON.stringify(d));

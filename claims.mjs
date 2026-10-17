@@ -23,7 +23,10 @@ export const OLD_SHAPE_MINUTES = 15;
 /** `readings` is box -> { available_gib, at }: the latest sample from the box's
  *  own monitor, put there by the hub. A reading older than `staleS` is ignored. */
 export function newLedger(budgets, { foreman = null, staleS = 120 } = {}) {
-  return { budgets: budgets || {}, foreman, leases: new Map(), readings: new Map(), staleMs: staleS * 1000 };
+  // `order` numbers every grant and every reading as it happens. "Granted since the
+  // reading" is a higher number, never a later clock: two events can share a clock
+  // value (a Windows clock steps coarsely), and a clock can step backwards.
+  return { budgets: budgets || {}, foreman, leases: new Map(), readings: new Map(), staleMs: staleS * 1000, order: 0 };
 }
 
 const iso = (ms) => new Date(ms).toISOString();
@@ -145,9 +148,9 @@ export function decide(L, req, now) {
     if (rd && now - rd.at <= L.staleMs) {
       let since = 0;
       for (const [r, l] of L.leases)
-        if (l.box === box && r !== resource && live(l, now) && l.cap_gib != null && Date.parse(l.since) > rd.at) since += l.cap_gib;
+        if (l.box === box && r !== resource && live(l, now) && l.cap_gib != null && l.order > rd.order) since += l.cap_gib;
       const own =
-        heldLive && heldLive.by === from && Date.parse(heldLive.since) <= rd.at ? Math.max(0, cap - (heldLive.cap_gib ?? 0)) : cap;
+        heldLive && heldLive.by === from && heldLive.order < rd.order ? Math.max(0, cap - (heldLive.cap_gib ?? 0)) : cap;
       // A reserve is added while its service is not healthy in the reading: a
       // reading taken while that service is stopped, or still loading, sees its
       // memory as free. A reading that cannot say what is healthy applies it.
@@ -182,11 +185,21 @@ export function decide(L, req, now) {
   };
 }
 
+/** A box monitor's reading: { available_gib, at, present }. `at` is for
+ *  staleness only; its place among the grants is the order it arrives in. */
+export function noteReading(L, box, reading) {
+  L.readings.set(box, { ...reading, order: ++L.order });
+}
+
 /** Apply a granted record. The hub calls this after archiving it; replay()
  *  calls it for each record read back from the archive. */
 export function apply(L, rec) {
   if (rec.kind === "claim") {
+    const prev = L.leases.get(rec.resource);
+    // a renewal keeps its first grant's place, as it keeps its since
+    const order = prev && prev.by === rec.from && prev.since === rec.since ? prev.order : ++L.order;
     L.leases.set(rec.resource, {
+      order,
       by: rec.from,
       box: rec.box ?? null,
       cap_gib: rec.cap_gib ?? null,

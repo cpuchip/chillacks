@@ -21,7 +21,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { URL } from "node:url";
-import { newLedger, decide, apply, sweep, view } from "./claims.mjs";
+import { newLedger, decide, apply, sweep, view, noteReading } from "./claims.mjs";
 
 const HOST = process.env.CHILLACKS_HOST || "127.0.0.1";
 const PORT = Number(process.env.CHILLACKS_PORT || 8790);
@@ -1007,7 +1007,7 @@ const server = http.createServer(async (req, res) => {
     telemetry.set(box, { at: now, sample: { ...p, box }, stale: false });
     // present = the services the box's monitor found healthy; a reserve on the row is held for the rest
     const present = new Set((Array.isArray(p.services) ? p.services : []).filter((x) => x?.healthy === true).map((x) => String(x.name)));
-    ledger.readings.set(box, { available_gib: p.mem.available_gib, at: now, present });
+    noteReading(ledger, box, { available_gib: p.mem.available_gib, at: now, present });
     if (was?.stale) hubStatus(`monitor-${box} reporting again; ${box}'s floor is back in force`);
     return json(200, { ok: true, box });
   }
