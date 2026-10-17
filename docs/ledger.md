@@ -221,49 +221,91 @@ This step is the plan owner's addendum, given when he approved it: every box rep
 load, disk, GPU activity and the processes behind them to the hub on its own, so that allocation is a
 deterministic judgement.
 
-A small monitor per box posts a sample every 30 s as that box's monitor identity (a token per box,
-minted through the roster like any seat). The table names Linux sources; a Windows box sends the
-same record from its own (`Get-CimInstance` for memory and load, `nvidia-smi`, `docker stats`).
+### The monitor
 
-| field | Linux source | |
+`monitor.mjs`, Node with no dependencies, because every box that carries seats already runs Node for
+the shim. It runs as the box's agent user, takes a sample every `MONITOR_INTERVAL_S` (30), and posts
+it to the hub as the box's monitor identity. `--once` prints one sample and posts nothing; that is
+how a box checks its own figures by hand. Linux first; a Windows box sends the same record from its
+own sources (`Get-CimInstance` for memory and load, `nvidia-smi`), and its monitor is installed by
+that box's steward.
+
+Measured on one Linux box (32 threads, 14 containers, 577 pids) before the design was fixed:
+
+| field | Linux source | cost of one read |
 |---|---|---|
-| `mem_total`, `mem_available`, `swap_used` | `/proc/meminfo` | MemAvailable should already exclude tmpfs pages (Shmem); unverified, see below |
-| `tmpfs` per mount | `statvfs` on /tmp, /dev/shm | RSS does not see these; a past overrun was /tmp pages |
-| `load1`, `load5`, `cpus` | `/proc/loadavg`, `nproc` | |
-| `disk` per mount | `statvfs` | |
-| `gpu` per card | `nvidia-smi --query-gpu`, `--query-compute-apps` | util, memory, pids |
-| `top` | `/proc/*/status` VmRSS | top N pids by RSS: pid, user, rss, the executable and its first argument only (a full command line can carry a key), container name if any |
-| `containers` | `docker ps` + `docker stats --no-stream` | name, memory limit, memory used |
+| `mem`: total, available, swap used, shmem | `/proc/meminfo` | 0.3 ms |
+| `tmpfs`: used and size per mount (/tmp, /dev/shm) | `statfs` | 0.1 ms for three mounts |
+| `load`: 1 and 5 minute, cpus | `/proc/loadavg` | 1 ms |
+| `disk`: used and size per mount | `statfs` | (with tmpfs) |
+| `gpu`: per card, UUID, util, memory; compute apps with pid and memory | `nvidia-smi --query-gpu`, `--query-compute-apps` | about 50 ms for both |
+| `top`: the N largest processes by RSS | `/proc/*/status`, `/proc/*/cmdline`, `/proc/*/cgroup` | 9 ms for all pids |
+| `containers`: memory used and limit per container | cgroup v2: `memory.current` less `inactive_file`, and `memory.max` | 0.6 ms for all 14 |
+| container names | `docker ps` | 40 ms |
 
-The monitor runs as the box's agent user. Reading containers needs the docker group, which is
-root-equivalent; it is used only where that user already has it, confirmed per box, and the
-`containers` field is left out where it does not.
+A sample costs about 60 ms of wall time and 25 ms of CPU, roughly 0.1% of one core at a 30 s
+cadence. `docker stats --no-stream` was measured too, at 2.07 s per call; the cgroup figure equals
+its memory column for every running container within rounding, so the monitor reads cgroups and
+never calls it. Container memory needs no docker group (cgroup files are world-readable). Only the
+names do, through `docker ps`; where the agent user cannot run it, a container is reported by its id.
 
-The hub keeps the latest sample per box in memory and serves `GET /telemetry`. A sample is a
-reading, so it stays out of the archive.
+**tmpfs, measured with controls.** Writing 2 GiB to `/dev/shm` in 512 MiB steps lowered
+`MemAvailable` by 514, 999, 1531 and 2040 MiB, and raised `Shmem` and the mount's used figure by
+exactly the amount written; deleting the file gave it back. The same writes to disk left
+`MemAvailable` within noise (+61 to +100 MiB). So `mem.available` counts what tmpfs holds, which RSS
+cannot: the floor check below sees it. The same box held 8 GiB in `/dev/shm` at the time, a
+production service's deleted mmap; the sample reports it on the tmpfs line and in `mem.shmem`.
 
-A sample older than 2 minutes is stale. A box with a static `mem_gib` then falls back to its caps
-alone (no floor) and the hub writes one `status` record saying so; only a box whose budget comes
-from telemetry closes. A monitor that hiccups therefore costs a floor check, and wakes nobody.
+**Command lines.** `top` carries the executable's base name and its first argument only. A first
+argument that is a flag keeps its name and drops anything after `=`; one that looks like a secret
+(the words key, token, secret or password, or a long unbroken run of base64) is replaced by
+`<redacted>`. A sample is a reading: it is never archived.
 
-Then the budget reads against the box:
+### The record
 
-- **A floor beside the caps.** A budgeted claim on a box with fresh telemetry is also refused when
-  `mem_available - cap < floor_gib` (the row's, with a default). Caps are self-declared, host runs and tmpfs escape them, and this
-  catches the claim the arithmetic would grant and a person reading `free -g` would not.
-- **A box with no lent budget** (one whose headroom is "what the box has free") opens once its monitor
-  reports. Its formula is the open question of this step: a job granted a minute ago does not show
-  in `mem_available` yet, so the free figure alone over-grants. The first box's monitor runs beside a
-  box with a static budget so the two can be compared before either decides anything.
+```json
+{
+  "v": 1, "box": "boxa", "ts": "2026-10-17T01:00:00.000Z", "interval_s": 30, "sample_ms": 58,
+  "mem": { "total_gib": 60.4, "available_gib": 43.5, "swap_used_gib": 2.1, "shmem_gib": 8.4 },
+  "tmpfs": [{ "mount": "/dev/shm", "used_gib": 8.0, "size_gib": 30.2 }],
+  "load": { "load1": 0.2, "load5": 0.3, "cpus": 32 },
+  "disk": [{ "mount": "/", "used_gib": 224.1, "size_gib": 1830.4 }],
+  "gpu": [{ "uuid": "GPU-...", "util_pct": 0, "mem_used_gib": 23.4, "mem_total_gib": 24.0,
+            "apps": [{ "pid": 4242, "mem_gib": 23.1 }] }],
+  "top": [{ "pid": 4242, "user": "claude", "rss_gib": 10.1, "exe": "python3", "arg1": "-m", "container": "prod" }],
+  "containers": [{ "name": "prod", "mem_gib": 10.1, "limit_gib": null }]
+}
+```
+
+### The hub
+
+- `POST /telemetry` takes a sample only from an identity named `monitor-<box>`, and files it under
+  that box. The box is read from the token's name, so a seat cannot report another box's memory. A malformed sample is refused (400).
+- The hub keeps the latest sample per box in memory and serves `GET /telemetry`; the roster carries
+  each box's age, available memory and load.
+- A sample older than 120 s is stale. The hub writes one `status` record when a box goes stale and
+  one when it reports again, and wakes nobody.
+
+### Budgets read against the box
+
+- **A floor beside the caps.** With a fresh sample and a `floor_gib` on the row, a budgeted claim is
+  also refused (`below_floor`, route null: the claimant retries) when
+  `mem.available - caps granted since the sample - this cap < floor_gib`. Caps granted since the
+  sample count against it because a job granted a minute ago may not have allocated yet, and two
+  quick claims would otherwise each pass the floor against the same reading. Caps are self-declared,
+  host runs and tmpfs escape them, and this is the claim the arithmetic would grant and a person
+  reading `free -g` would not.
+- **A stale or missing sample** leaves the caps alone in force, with no floor: a monitor that hiccups
+  costs the floor check, and wakes nobody.
+- **A box with no lent budget** (one whose headroom is "what the box has free") stays closed in this
+  step. Its formula is the open question: the free figure alone over-grants for the reason above. The
+  first box's monitor runs beside its static budget so the two can be compared before either decides.
 - **An expired lease whose container still runs** is the overrun the steward is woken for (step 5).
   It is matched on the lease's own resource, which is the container name the claim gave. Boxes name
   job containers by their own conventions, so a name pattern would miss some of them.
 
-A monitor's figures are checked once by hand against the box's own tools (`free`, `df`,
-`nvidia-smi`) before the hub reads budgets against them. The first check is tmpfs: write a known
-size to `/dev/shm`, and confirm `mem_available` drops by it and the tmpfs figure rises by it. One
-box has already held gigabytes in `/dev/shm` that a listing of its files did not show, so the
-check runs on that box first.
+Before the hub reads budgets against a box's monitor, that box's figures are checked once by hand
+against its own tools (`free -b`, `df -B1`, `nvidia-smi`), and the check is recorded.
 
 ## 5. Routing
 
