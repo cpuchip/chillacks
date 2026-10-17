@@ -16,6 +16,9 @@
  *   MONITOR_INTERVAL_S   default 30
  *   MONITOR_TOP          how many of the largest processes to report (default 10)
  *   MONITOR_DISKS        comma-separated mounts (default "/")
+ *   MONITOR_SERVICES     comma-separated name=url health checks; a service is healthy only
+ *                        when its URL answers 200 (running is not ready: a model server
+ *                        holds its memory only once it has loaded). The URL is not reported.
  *
  * Linux only for now: /proc, statfs and cgroup v2. A Windows box sends the same
  * record from its own sources, in a later change.
@@ -181,8 +184,23 @@ function topProcesses(n, names) {
   return out;
 }
 
-/** One sample. Every figure comes from a file read or one short command. */
-export async function sample({ box = os.hostname(), top = 10, disks = ["/"], tmpfsMounts = ["/tmp", "/dev/shm"], interval_s = 30 } = {}) {
+/** Each named service's health: 200 is healthy; anything else, or no answer in 2 s, is not. */
+async function health(services) {
+  return Promise.all(
+    services.map(async ({ name, url }) => {
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+        await r.body?.cancel();
+        return { name, healthy: r.status === 200, status: r.status };
+      } catch {
+        return { name, healthy: false, status: null };
+      }
+    }),
+  );
+}
+
+/** One sample. Every figure comes from a file read, one short command, or a local health check. */
+export async function sample({ box = os.hostname(), top = 10, disks = ["/"], tmpfsMounts = ["/tmp", "/dev/shm"], interval_s = 30, services = [] } = {}) {
   const t0 = process.hrtime.bigint();
   const names = dockerNames();
   const load = fs.readFileSync("/proc/loadavg", "utf8").split(" ");
@@ -203,6 +221,7 @@ export async function sample({ box = os.hostname(), top = 10, disks = ["/"], tmp
     gpu: gpus(),
     top: topProcesses(top, names),
     containers: containers(names),
+    services: await health(services),
   };
   rec.sample_ms = Math.round(Number(process.hrtime.bigint() - t0) / 1e5) / 10;
   return rec;
@@ -218,6 +237,11 @@ async function main() {
     top: Number(process.env.MONITOR_TOP || 10),
     disks: (process.env.MONITOR_DISKS || "/").split(",").map((s) => s.trim()).filter(Boolean),
     interval_s: Number(process.env.MONITOR_INTERVAL_S || 30),
+    services: (process.env.MONITOR_SERVICES || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .map((x) => ({ name: x.slice(0, x.indexOf("=")), url: x.slice(x.indexOf("=") + 1) })),
   };
   if (process.argv.includes("--once")) {
     console.log(JSON.stringify(await sample(opts), null, 2));

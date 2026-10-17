@@ -63,6 +63,13 @@ function rowProblem(row) {
     return `mem_gib must be a number of GiB, 0 or more (got ${JSON.stringify(row.mem_gib)})`;
   if (row.floor_gib != null && !(Number.isFinite(row.floor_gib) && row.floor_gib >= 0))
     return `floor_gib must be a number of GiB, 0 or more (got ${JSON.stringify(row.floor_gib)})`;
+  if (row.reserve != null) {
+    if (row.floor_gib == null) return "a reserve needs a floor_gib to add to";
+    if (!Array.isArray(row.reserve)) return "reserve must be a list of {absent, gib}";
+    for (const r of row.reserve)
+      if (!r || typeof r.absent !== "string" || !r.absent || !Number.isFinite(r.gib) || r.gib < 0)
+        return `each reserve is {absent: <service name>, gib: <number, 0 or more>} (got ${JSON.stringify(r)})`;
+  }
   return null;
 }
 
@@ -141,12 +148,19 @@ export function decide(L, req, now) {
         if (l.box === box && r !== resource && live(l, now) && l.cap_gib != null && Date.parse(l.since) > rd.at) since += l.cap_gib;
       const own =
         heldLive && heldLive.by === from && Date.parse(heldLive.since) <= rd.at ? Math.max(0, cap - (heldLive.cap_gib ?? 0)) : cap;
-      if (rd.available_gib - since - own < row.floor_gib)
+      // A reserve is added while its service is not healthy in the reading: a
+      // reading taken while that service is stopped, or still loading, sees its
+      // memory as free. A reading that cannot say what is healthy applies it.
+      const missing = (row.reserve || []).filter((r) => !rd.present?.has(r.absent));
+      const reserve = missing.reduce((a, r) => a + r.gib, 0);
+      const floor = row.floor_gib + reserve;
+      if (rd.available_gib - since - own < floor)
         return refuse(
           "below_floor",
-          `${box}: ${rd.available_gib} GiB available at its last reading, less ${since} granted since, less ${own} asked, is under its ${row.floor_gib} GiB floor`,
+          `${box}: ${rd.available_gib} GiB available at its last reading, less ${since} granted since, less ${own} asked, is under its ${floor} GiB floor` +
+            (missing.length ? ` (${row.floor_gib} plus ${reserve} held for ${missing.map((r) => r.absent).join(", ")}, not healthy at the reading)` : ""),
           null,
-          { box, available_gib: rd.available_gib, granted_since_gib: since, asked_gib: own, floor_gib: row.floor_gib },
+          { box, available_gib: rd.available_gib, granted_since_gib: since, asked_gib: own, floor_gib: floor, reserve_gib: reserve },
         );
     }
   }

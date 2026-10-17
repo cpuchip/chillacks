@@ -1005,7 +1005,9 @@ const server = http.createServer(async (req, res) => {
     const now = Date.now();
     const was = telemetry.get(box);
     telemetry.set(box, { at: now, sample: { ...p, box }, stale: false });
-    ledger.readings.set(box, { available_gib: p.mem.available_gib, at: now });
+    // present = the services the box's monitor found healthy; a reserve on the row is held for the rest
+    const present = new Set((Array.isArray(p.services) ? p.services : []).filter((x) => x?.healthy === true).map((x) => String(x.name)));
+    ledger.readings.set(box, { available_gib: p.mem.available_gib, at: now, present });
     if (was?.stale) hubStatus(`monitor-${box} reporting again; ${box}'s floor is back in force`);
     return json(200, { ok: true, box });
   }

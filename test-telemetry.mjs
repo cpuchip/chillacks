@@ -151,6 +151,28 @@ const back = lines().filter((m) => m.kind === "status" && m.from === "chillacks"
 check("reporting again writes one status record", back.length === 1, JSON.stringify(back.map((m) => m.text)));
 check("no status record woke anyone", [...inbox.alice, ...inbox.bob].every((m) => m.kind !== "status"), JSON.stringify(inbox));
 
+// ── a reserve, read from the sample's healthy services (the box steward's rule) ─
+// boxr holds 12 GiB back while "prod" is not healthy: stopped, or still loading
+fs.writeFileSync(path.join(DIR, "budgets.json"), JSON.stringify({
+  boxa: { mem_gib: 16, floor_gib: 8, route: "boxa-steward" },
+  boxc: { mem_gib: 16, route: "boxc-steward" },
+  boxr: { mem_gib: 40, floor_gib: 8, reserve: [{ absent: "prod", gib: 12 }], route: "boxr-steward" },
+}));
+TOK["monitor-boxr"] = "tele-token-monr-rrrrrrrrrrrr";
+fs.writeFileSync(TOKENS_FILE, JSON.stringify(TOK));
+await settle(700);
+const withSvc = (healthy) => ({ ...sampleOf("boxr", 30), ...(healthy === undefined ? {} : { services: [{ name: "prod", healthy, status: healthy ? 200 : 503 }] }) });
+await post("monitor-boxr", "/telemetry", withSvc(true));
+const ok1 = await post("alice", "/claim", { resource: "r1", box: "boxr", cap_gib: 15, minutes: 5 });
+check("reserve: prod healthy, the floor is 8 (30 - 15 >= 8)", ok1.ok === true, JSON.stringify(ok1));
+await post("alice", "/claim", { resource: "r1", release: true });
+await post("monitor-boxr", "/telemetry", withSvc(false));
+const no1 = await post("alice", "/claim", { resource: "r1", box: "boxr", cap_gib: 15, minutes: 5 });
+check("reserve: prod running but not healthy (loading), the floor is 20", no1.ok === false && no1.code === "below_floor" && no1.floor_gib === 20, JSON.stringify(no1));
+await post("monitor-boxr", "/telemetry", withSvc(undefined));
+const no2 = await post("alice", "/claim", { resource: "r1", box: "boxr", cap_gib: 15, minutes: 5 });
+check("reserve: a sample with no services applies the reserve", no2.ok === false && no2.reserve_gib === 12, JSON.stringify(no2));
+
 // ── a restart: no reading until the monitor posts ──────────────────────────
 hub.kill();
 await settle(400);

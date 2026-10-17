@@ -311,7 +311,9 @@ and posts nothing. The hub keeps the latest sample per box in memory (never
 archived), shows it on the roster and at `GET /telemetry`, and reads a budget
 row's `floor_gib` against it: a claim is refused `below_floor` when the box's
 available memory, less what was granted since the sample, less the claim, would
-fall under the floor. A monitor quiet for `CHILLACKS_TELEMETRY_STALE_S` (120)
+fall under the floor, plus any `reserve` the row holds for a service that is not
+healthy in the sample (stopped or still loading; `MONITOR_SERVICES` names each
+service's health URL). A monitor quiet for `CHILLACKS_TELEMETRY_STALE_S` (120)
 leaves the caps alone in force, with one status record each way. Linux for now;
 design and measurements in [`docs/ledger.md`](docs/ledger.md) section 4.
 

@@ -70,8 +70,25 @@ const retitled = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"],
 process.on("exit", () => { for (const c of [titled, flagged, prose, retitled]) try { c.kill(); } catch {} fs.rmSync(proseDir, { recursive: true, force: true }); });
 await new Promise((r) => setTimeout(r, 800));
 
+// three services: one healthy, one answering 503 (running, still loading), one not listening
+import http from "node:http";
+const serve = (code) => new Promise((r) => { const sv = http.createServer((_q, w) => { w.writeHead(code); w.end(); }); sv.listen(0, "127.0.0.1", () => r(sv)); });
+const up = await serve(200), loading = await serve(503);
+const closed = await new Promise((r) => { const sv = http.createServer(); sv.listen(0, "127.0.0.1", () => { const p = sv.address().port; sv.close(() => r(p)); }); });
+const services = [
+  { name: "svc-up", url: `http://127.0.0.1:${up.address().port}/health` },
+  { name: "svc-loading", url: `http://127.0.0.1:${loading.address().port}/health` },
+  { name: "svc-down", url: `http://127.0.0.1:${closed}/health` },
+];
+
 // ── one sample, taken now, and the box's own tools right after ─────────────
-const s = await sample({ box: "testbox", top: 2000, disks: ["/"] });
+const s = await sample({ box: "testbox", top: 2000, disks: ["/"], services });
+up.close(); loading.close();
+const svc = Object.fromEntries((s.services || []).map((x) => [x.name, x]));
+check("a service whose health answers 200 is healthy", svc["svc-up"]?.healthy === true, JSON.stringify(s.services));
+check("a service answering 503 is not (running, not ready)", svc["svc-loading"]?.healthy === false && svc["svc-loading"]?.status === 503, JSON.stringify(svc["svc-loading"]));
+check("a service not listening is not", svc["svc-down"]?.healthy === false && svc["svc-down"]?.status === null, JSON.stringify(svc["svc-down"]));
+check("a health URL is not in the sample", !JSON.stringify(s.services).includes("127.0.0.1"));
 const free = sh("free", ["-b"]);
 const memLine = free?.split("\n").find((l) => l.startsWith("Mem:"))?.split(/\s+/);
 const swapLine = free?.split("\n").find((l) => l.startsWith("Swap:"))?.split(/\s+/);

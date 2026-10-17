@@ -274,7 +274,8 @@ argument that is a flag keeps its name and drops anything after `=`; one that lo
   "gpu": [{ "uuid": "GPU-...", "util_pct": 0, "mem_used_gib": 23.4, "mem_total_gib": 24.0,
             "apps": [{ "pid": 4242, "mem_gib": 23.1 }] }],
   "top": [{ "pid": 4242, "user": "claude", "rss_gib": 10.1, "exe": "python3", "arg1": "-m", "container": "prod" }],
-  "containers": [{ "name": "prod", "mem_gib": 10.1, "limit_gib": null }]
+  "containers": [{ "name": "prod", "mem_gib": 10.1, "limit_gib": null }],
+  "services": [{ "name": "prod", "healthy": true, "status": 200 }]
 }
 ```
 
@@ -296,6 +297,16 @@ argument that is a flag keeps its name and drops anything after `=`; one that lo
   quick claims would otherwise each pass the floor against the same reading. Caps are self-declared,
   host runs and tmpfs escape them, and this is the claim the arithmetic would grant and a person
   reading `free -g` would not.
+- **A reserve while a service is not ready.** A row may carry
+  `"reserve": [{"absent": "<service>", "gib": N}]`: N is added to the floor while the named service is
+  not healthy in the box's latest sample. A reading taken while that service is stopped (a card lent
+  away) sees its memory as free, and lending it would put the service's restore on top of the loan;
+  so would a reading taken while it is running but still loading. Healthy means its health URL
+  answered 200 to the monitor (`MONITOR_SERVICES="name=url,..."`; the URL stays on the box), and a
+  sample that names no services applies every reserve. The figures that set one box's row (floor 8,
+  reserve 12 for its model server, whose cold start runs about 3.5 minutes) were that box's own:
+  MemAvailable's daily minimum since the server went live, the largest 10-minute drop, and hot page
+  cache.
 - **A stale or missing sample** leaves the caps alone in force, with no floor: a monitor that hiccups
   costs the floor check, and wakes nobody.
 - **A box with no lent budget** (one whose headroom is "what the box has free") stays closed in this

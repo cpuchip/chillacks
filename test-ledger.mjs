@@ -236,6 +236,37 @@ function claim(L, from, req, now = T0) {
   check("floor: a floor_gib that is not a number makes the row unusable", bf.ok === false && bf.code === "bad_budget", JSON.stringify(bf));
 }
 
+// ── a reserve: what the floor adds while a named service is absent (the box steward's rule) ─
+// A reading taken while production is stopped (its card lent) sees production's
+// memory as free; lending it would put production's restore on top of the loan.
+{
+  const RB = { boxa: { mem_gib: 40, floor_gib: 8, reserve: [{ absent: "prod", gib: 12 }], route: "s" } };
+  const L = newLedger(RB, { foreman: FOREMAN });
+  L.readings.set("boxa", { available_gib: 30, at: T0, present: new Set(["prod", "db"]) });
+  const a = claim(L, "alice", { resource: "a", box: "boxa", cap_gib: 20, minutes: 5 }, T0 + 1000);
+  check("reserve: with prod present the floor is 8 (30 - 20 >= 8)", a.ok === true, JSON.stringify(a));
+  claim(L, "alice", { resource: "a", release: true }, T0 + 2000);
+  L.readings.set("boxa", { available_gib: 30, at: T0 + 3000, present: new Set(["db"]) });
+  const b = claim(L, "bob", { resource: "b", box: "boxa", cap_gib: 12, minutes: 5 }, T0 + 4000);
+  check("reserve: with prod absent the floor is 8 + 12 (30 - 12 < 20)", b.ok === false && b.code === "below_floor" && b.floor_gib === 20 && b.reserve_gib === 12, JSON.stringify(b));
+  check("reserve: the refusal names what is absent", /prod/.test(b.reason ?? ""), b.reason);
+  const c = claim(L, "bob", { resource: "b", box: "boxa", cap_gib: 10, minutes: 5 }, T0 + 5000);
+  check("reserve: a claim that leaves the raised floor is granted (30 - 10 >= 20)", c.ok === true, JSON.stringify(c));
+  L.readings.set("boxa", { available_gib: 30, at: T0 + 6000 }); // a sample with no container list
+  // bob's 10 GiB was granted before this reading, so the reading already holds it
+  const d = claim(L, "carol", { resource: "c", box: "boxa", cap_gib: 11, minutes: 5 }, T0 + 7000);
+  check("reserve: a reading that cannot say what is healthy applies the reserve (30 - 11 < 20)", d.ok === false && d.code === "below_floor" && d.reserve_gib === 12, JSON.stringify(d));
+  for (const [label, row] of [
+    ["reserve not a list", { mem_gib: 40, floor_gib: 8, reserve: { absent: "prod", gib: 12 } }],
+    ["reserve gib not a number", { mem_gib: 40, floor_gib: 8, reserve: [{ absent: "prod", gib: "12" }] }],
+    ["reserve without a name", { mem_gib: 40, floor_gib: 8, reserve: [{ gib: 12 }] }],
+    ["reserve without a floor", { mem_gib: 40, reserve: [{ absent: "prod", gib: 12 }] }],
+  ]) {
+    const bad = claim(newLedger({ boxq: row }, { foreman: FOREMAN }), "probe", { resource: "p", box: "boxq", cap_gib: 1, minutes: 5 }, T0);
+    check(`reserve: an unusable row refuses (${label})`, bad.ok === false && bad.code === "bad_budget", JSON.stringify(bad));
+  }
+}
+
 // ── replay: the ledger rebuilt from its own records is the same ledger ──────
 {
   const L = newLedger(BUDGETS, { foreman: FOREMAN });
