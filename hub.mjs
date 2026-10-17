@@ -42,6 +42,13 @@ console.error = (...a) => stderr(new Date().toISOString(), ...a);
 
 const LOOPBACK = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhost";
 
+// Anything that still escapes is logged with a timestamp before the process
+// ends, so the log says why the room went down.
+process.on("uncaughtException", (e) => {
+  console.error(`[chillacks] ! uncaught, exiting: ${e?.stack || e}`);
+  process.exit(1);
+});
+
 // Refuse to go wide open. Binding the mesh IP without a token would put an
 // unauthenticated text pipe in front of sessions running --dangerously-skip-permissions.
 if (!LOOPBACK && !TOKEN) {
@@ -628,6 +635,7 @@ function wsTextFrame(str) {
 }
 
 const WS_PING = Buffer.from([0x89, 0x00]);
+const WS_MAX_FRAME = 1 << 20;
 const WS_CLOSE = Buffer.from([0x88, 0x00]);
 
 /** Feed inbound bytes; handle close (echo + done) and ping (pong). Data
@@ -644,6 +652,9 @@ function wsConsume(state, chunk, sock) {
     let len = b[1] & 0x7f, off = 2;
     if (len === 126) { if (b.length < 4) return false; len = b.readUInt16BE(2); off = 4; }
     else if (len === 127) { if (b.length < 10) return false; len = Number(b.readBigUInt64BE(2)); off = 10; }
+    // A client only ever sends control frames here (close, ping), so a frame past
+    // the cap is closed on rather than buffered: the length is the client's word.
+    if (len > WS_MAX_FRAME) return true;
     const maskOff = off, dataOff = masked ? off + 4 : off;
     if (b.length < dataOff + len) return false;
     let payload = b.subarray(dataOff, dataOff + len);
@@ -1035,7 +1046,21 @@ async function route(req, res) {
 // that keep the token out of transcripts some other way), header token (for
 // real ws clients that can send headers, e.g. the codex bridge). The same
 // browser wall as HTTP: an Origin header means a browser sent it — refuse.
-server.on("upgrade", (req, socket) => {
+// The upgrade handler is reached before any token is checked, so a throw in it
+// (one raw request with an absolute-form target such as http://a:99999/ws made
+// new URL() throw) ended the hub with no credential at all. It is wrapped like
+// route(): logged, refused 400, the room carries on.
+server.on("upgrade", (req, socket, head) => {
+  try {
+    upgradeRoute(req, socket, head);
+  } catch (e) {
+    console.error(`[chillacks] ! ws upgrade threw: ${e?.stack || e}`);
+    try { socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"); } catch {}
+    socket.destroy();
+  }
+});
+
+function upgradeRoute(req, socket, head) {
   const refuse = (code, why) => {
     console.error(`[chillacks] ! ws refused (${why})`);
     try { socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`); } catch {}
@@ -1099,6 +1124,9 @@ server.on("upgrade", (req, socket) => {
 
   const ping = setInterval(() => { try { socket.write(WS_PING); } catch {} }, 25_000);
   const state = { buf: Buffer.alloc(0) };
+  // bytes that arrived with the handshake come as `head`, not as socket data:
+  // parse them first, or the frames after them are read from the wrong offset
+  if (head?.length && wsConsume(state, head, socket)) return end();
   socket.on("data", (chunk) => { if (wsConsume(state, chunk, socket)) end(); });
   const bye = () => {
     clearInterval(ping);
@@ -1106,7 +1134,7 @@ server.on("upgrade", (req, socket) => {
   };
   socket.on("close", bye);
   socket.on("error", bye);
-});
+}
 
 // A clean stop delivers what windows hold before the streams close. A forced
 // kill (Stop-Process -Force on Windows, SIGKILL) runs no handler; recoverHeld()
