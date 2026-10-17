@@ -7,12 +7,13 @@
   "type": "module",
   "scripts": {
     "hub": "node hub.mjs",
-    "test": "node test-ledger.mjs && node test-ledger-hub.mjs && node test-quiet.mjs && node test-e2e.mjs && node test-identity.mjs && node test-hotload.mjs && node test-v02.mjs && node test-streams.mjs && node test-stewards-bridge.mjs && node test-tokens-managed.mjs",
+    "test": "node test-ledger.mjs && node test-ledger-hub.mjs && node test-quiet.mjs && node test-monitor.mjs && node test-e2e.mjs && node test-identity.mjs && node test-hotload.mjs && node test-v02.mjs && node test-streams.mjs && node test-stewards-bridge.mjs && node test-tokens-managed.mjs",
     "test:e2e": "node test-e2e.mjs",
     "test:stewards-bridge": "node test-stewards-bridge.mjs",
     "test:identity": "node test-identity.mjs",
     "check-archive": "node check-archive.mjs",
-    "tokens": "node tokens.mjs"
+    "tokens": "node tokens.mjs",
+    "monitor": "node monitor.mjs"
   },
   "engines": {
     "node": ">=18"
